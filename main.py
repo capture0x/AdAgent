@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  AdAgent — AI-Powered Active Directory Attack Orchestrator           ║
+║  AdAgent — AI-Powered Active Directory Attack Agent                  ║
 ║  AUTHORISED PENETRATION TESTING & RED TEAM ENGAGEMENTS ONLY          ║
 ║                                               By TMRSWRR             ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -73,7 +73,7 @@ def _tagline() -> str:
     sep  = f"{GRAY}{'─' * 80}{RST}"
 
     row1 = (
-        f"  {CYAN}{BOLD}AI ACTIVE DIRECTORY ATTACK ORCHESTRATOR{RST}"
+        f"  {CYAN}{BOLD}AI ACTIVE DIRECTORY ATTACK AGENT{RST}"
         f"  {GRAY}|{RST}  "
         f"{VIOLET}{BOLD}v{VERSION} «{CODENAME}»{RST}"
         f"  {GRAY}|  build {BUILD}{RST}"
@@ -200,7 +200,7 @@ def _dashboard():
     mid = f"  {MG}╠{'═' * (W-2)}╣{RST}"
 
     # ── Header ────────────────────────────────────────────────────────────────
-    title    = f"{P}{BOLD}  ADAGENT{RST}  {SW}v{VERSION}  ·  Active Directory Attack Orchestrator{RST}"
+    title    = f"{P}{BOLD}  ADAGENT{RST}  {SW}v{VERSION}  ·  Active Directory Attack Agent{RST}"
     time_str = f"{SW}{now}{RST}"
     title_v  = _strip_ansi(title)
     time_v   = _strip_ansi(time_str)
@@ -561,7 +561,7 @@ def run_report():
 # ══════════════════════════════════════════════════════════════════════════════
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="AdAgent — AI-powered Active Directory attack orchestrator",
+        description="AdAgent — AI-powered Active Directory attack agent",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--session", metavar="PATH", help="load a session JSON file before running")

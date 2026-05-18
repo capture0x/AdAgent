@@ -109,6 +109,43 @@ Each finding card shows severity badge, **CVSS v3.1 score and vector**, MITRE AT
 
 ---
 
+## Quick Start
+
+```bash
+git clone https://github.com/capture0x/AdAgent.git
+cd AdAgent
+chmod +x install.sh run.sh
+./install.sh
+cp .env.example .env
+nano .env          # set DC_IP, DOMAIN, USERNAME, PASSWORD
+./run.sh
+```
+
+### AI Backend Setup
+
+**Ollama (local, free — recommended):**
+```bash
+ollama pull qwen2.5-coder:7b
+ollama serve
+```
+
+**Claude API:**
+```bash
+# Add to .env:
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### CLI Options
+
+```bash
+./run.sh              # interactive menu
+./run.sh --agent      # launch agent directly
+./run.sh --session path/to/session.json
+./run.sh --no-banner
+```
+
+---
+
 ## Features
 
 | | |
@@ -255,43 +292,6 @@ Each finding card shows severity badge, **CVSS v3.1 score and vector**, MITRE AT
 | `agent_complete` | End mission with summary |
 
 </details>
-
----
-
-## Quick Start
-
-```bash
-git clone https://github.com/capture0x/AdAgent.git
-cd AdAgent
-chmod +x install.sh run.sh
-./install.sh
-cp .env.example .env
-nano .env          # set DC_IP, DOMAIN, USERNAME, PASSWORD
-./run.sh
-```
-
-### AI Backend Setup
-
-**Ollama (local, free — recommended):**
-```bash
-ollama pull qwen2.5-coder:7b
-ollama serve
-```
-
-**Claude API:**
-```bash
-# Add to .env:
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-### CLI Options
-
-```bash
-./run.sh              # interactive menu
-./run.sh --agent      # launch agent directly
-./run.sh --session path/to/session.json
-./run.sh --no-banner
-```
 
 ---
 

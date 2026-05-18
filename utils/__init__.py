@@ -1,0 +1,1 @@
+"""AdStrike — utility helpers package."""

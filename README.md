@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <b>AI-Powered Active Directory Attack Orchestrator</b><br/>
+  <b>AI-Powered Active Directory Attack Agent</b><br/>
   <sub>59 tools · 139 techniques · Autonomous kill-chain execution · Ollama + Claude</sub>
 </p>
 

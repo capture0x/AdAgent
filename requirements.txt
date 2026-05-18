@@ -1,0 +1,23 @@
+# AdAgent — Python Dependencies
+# Install: pip install -r requirements.txt
+# Or run: ./install.sh
+
+# ── Core ──────────────────────────────────────────────────────
+impacket>=0.12.0
+ldap3>=2.9.1
+dnspython>=2.4.0
+pyasn1>=0.5.0
+pycryptodome>=3.19.0
+
+# ── AI Backend ────────────────────────────────────────────────
+anthropic>=0.40.0        # Claude API (optional — Ollama is free alternative)
+requests>=2.31.0         # Ollama local API
+
+# ── Reporting ─────────────────────────────────────────────────
+jinja2>=3.1.2
+markdown>=3.5.1
+
+# ── Utility ───────────────────────────────────────────────────
+colorama>=0.4.6
+python-dotenv>=1.0.0
+chardet<6

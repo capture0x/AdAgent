@@ -18,7 +18,7 @@
 
 ---
 
-> **AUTHORISED PENETRATION TESTING AND RED TEAM ENGAGEMENTS ONLY.**
+> **Authorized use only. Do not run this tool against systems without explicit written permission.**
 > This tool automates offensive AD techniques that can cause account lockouts, service disruption, or domain compromise.
 
 ---

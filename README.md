@@ -50,7 +50,7 @@ nano .env          # set DC_IP, DOMAIN, USERNAME, PASSWORD
 ```
 ## How to use 
 
-[![How to use](/assets/ADAGENT.png)](https://youtu.be/guLQGFbiNHw)
+[![How to use](/assets/ADAGENT.png)](https://youtu.be/guLQGFbiNHw?si=7lcvTkYxGAxde4X-)
 
 ### AI Backend Setup
 

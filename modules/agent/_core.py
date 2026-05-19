@@ -11488,7 +11488,7 @@ def run():
     bar  = f"  {V}{'─' * min(72, W_cols - 4)}{RST}"
     print()
     print(bar)
-    print(f"  {C}{BOLD}  ADAGENT{RST}  {GR}v1.0  ·  AI-Powered Active Directory Attack Orchestrator{RST}")
+    print(f"  {C}{BOLD}  ADAGENT{RST}  {GR}v1.0  ·  AI-Powered Active Directory Attack Agent{RST}")
     print(f"  {GR}  59 tools · 139 techniques · Ollama + Claude · by tmrswrr{RST}")
     print(bar)
     print()

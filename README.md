@@ -48,6 +48,9 @@ cp .env.example .env
 nano .env          # set DC_IP, DOMAIN, USERNAME, PASSWORD
 ./run.sh
 ```
+## How to use 
+
+[![How to use](/assets/ADAGENT.png)](https://youtu.be/guLQGFbiNHw)
 
 ### AI Backend Setup
 

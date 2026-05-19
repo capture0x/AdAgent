@@ -63,13 +63,93 @@ ollama serve
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-### CLI Options
+### Interactive Menu Options
 
 ```bash
 ./run.sh              # interactive menu
-./run.sh --agent      # launch agent directly
+./run.sh --agent      # launch agent directly (skip menu)
 ./run.sh --session path/to/session.json
 ./run.sh --no-banner
+```
+
+---
+
+## CLI Mode
+
+Skip the interactive menus entirely — pass all settings as flags and the agent starts immediately.
+
+```bash
+chmod +x adcli.sh run.sh
+```
+
+### Password Auth — Ollama (local, free)
+
+```bash
+./run.sh --dc 10.10.10.10 --domain corp.local --user john --pass Password123 \
+         --attacker 10.10.14.5 --opsec normal
+```
+
+### NT Hash / Pass-the-Hash — Claude
+
+```bash
+./run.sh --dc 10.10.10.10 --domain corp.local --user administrator \
+         --hash aad3b435b51404eeaad3b435b51404ee:abc123def456... \
+         --backend claude --model sonnet --opsec loud
+```
+
+### Kerberos ccache
+
+```bash
+./run.sh --dc 10.10.10.10 --domain corp.local --user john \
+         --ccache /tmp/john.ccache --opsec stealth
+```
+
+### NULL Session (no credentials)
+
+```bash
+./run.sh --dc 10.10.10.10 --domain corp.local --opsec normal
+```
+
+### Plan Only — generate attack plan without executing tools
+
+```bash
+./run.sh --dc 10.10.10.10 --domain corp.local --user john \
+         --pass Password123 --mode plan
+```
+
+### All CLI Flags
+
+| Flag | Description | Default |
+|---|---|---|
+| `--dc` | Domain Controller IP | **required** |
+| `--domain` | AD domain (e.g. `corp.local`) | **required** |
+| `--user` | Username (omit for NULL session) | — |
+| `--pass` | Plaintext password | — |
+| `--hash` | NT hash (`LM:NT` or just `NT`) | — |
+| `--ccache` | Kerberos ccache file path | — |
+| `--attacker` | Your listener / attacker IP | — |
+| `--engagement` | Engagement name for reports | — |
+| `--backend` | `ollama` or `claude` | `ollama` |
+| `--model` | Model name or alias (`opus`/`sonnet`/`haiku` for Claude) | auto |
+| `--api-key` | Anthropic API key (or set `ANTHROPIC_API_KEY` env var) | — |
+| `--opsec` | `loud` · `normal` · `stealth` | `normal` |
+| `--mode` | `auto` = full run · `plan` = text plan only | `auto` |
+| `--rounds` | Override max agent rounds | built-in limit |
+| `--yes` | Skip 5-second confirmation countdown | — |
+| `--no-banner` | Suppress ASCII banner | — |
+
+> **Routing:** `./run.sh` auto-detects CLI mode when `--dc` or `--domain` is present and routes to `cli/adcli.py`. Without those flags it opens the interactive menu as usual.
+
+### CLI Mode File Structure
+
+```
+AdAgent/
+├── adcli.sh          ← standalone CLI launcher (alternative to run.sh)
+└── cli/
+    ├── adcli.py      ← entry point
+    ├── args.py       ← argument parser
+    ├── display.py    ← banner, profile table, countdown
+    └── runner.py     ← session injection + agent launch
 ```
 
 ---

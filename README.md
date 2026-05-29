@@ -458,6 +458,7 @@ Password spraying can lock accounts. DCSync, DCShadow, ADCS exploitation, and co
 <p align="center">
   <b>Creator:</b> tmrswrr &nbsp;·&nbsp;
   <b>GitHub:</b> <a href="https://github.com/capture0x">capture0x</a> &nbsp;·&nbsp;
+   </br>Contact: tmrswrr -at- gmail.com </br>
   <b>Framework:</b> AdStrike v5.0 «AdStrike» &nbsp;·&nbsp;
   <b>License:</b> MIT
 </p>

@@ -13,13 +13,13 @@ from utils.helpers import (
     BOLD, DIM, RST, fg,
 )
 
-# ── AdAgent professional palette — consistent with main.py ───────────────────
-_CYAN    = "\033[38;2;0;180;216m"     # #00B4D8 — primary labels / info
-_VIOLET  = "\033[38;2;123;47;190m"    # #7B2FBE — secondary accent
-_GREEN   = "\033[38;2;6;214;160m"     # #06D6A0 — success / findings
-_YELLOW  = "\033[38;2;255;183;3m"     # #FFB703 — warning
-_WHITE   = "\033[38;2;237;242;244m"   # #EDF2F4 — primary text / values
-_GRAY    = "\033[38;2;141;153;174m"   # #8D99AE — secondary text
+# ── AdAgent synthwave palette — consistent with main.py ───────────────────
+_CYAN    = "\033[38;2;45;226;230m"    # #2DE2E6 — primary labels / info
+_VIOLET  = "\033[38;2;185;103;255m"   # #B967FF — secondary accent / borders
+_GREEN   = "\033[38;2;54;241;205m"    # #36F1CD — mint · success / findings
+_YELLOW  = "\033[38;2;255;106;193m"   # #FF6AC1 — pink · warning
+_WHITE   = "\033[38;2;234;230;255m"   # #EAE6FF — lavender · text / values
+_GRAY    = "\033[38;2;139;131;168m"   # #8B83A8 — secondary text
 
 # ── Claude model selection ────────────────────────────────────────────────────
 MODEL      = "claude-sonnet-4-20250514"   # balanced default
@@ -47,7 +47,11 @@ AGENT_LIVE_COMMANDS = os.environ.get(
 
 # ── Ollama settings ───────────────────────────────────────────────────────────
 OLLAMA_API_TIMEOUT = int(os.environ.get("ADSTRIKE_OLLAMA_TIMEOUT", "20"))
-OLLAMA_MAX_TOOLS   = max(1, int(os.environ.get("ADSTRIKE_OLLAMA_MAX_TOOLS", "1")))
+# Default 2: present the local model an evidence-labeled menu of the top-N
+# candidate actions so it actually REASONS and picks by impact, instead of
+# rubber-stamping a single rule-engine choice. Set ADSTRIKE_OLLAMA_MAX_TOOLS=1
+# for the old deterministic (rule-engine-only) behavior on very weak models.
+OLLAMA_MAX_TOOLS   = max(1, int(os.environ.get("ADSTRIKE_OLLAMA_MAX_TOOLS", "2")))
 OLLAMA_SHOW_FALLBACK_WARNINGS = os.environ.get(
     "ADSTRIKE_OLLAMA_SHOW_FALLBACK_WARNINGS", "false"
 ).lower() in ("1", "true", "yes", "on")

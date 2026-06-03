@@ -1,0 +1,304 @@
+title: AdStrike - ACL/ACE Abuse Detection Rules
+id: sast-acl-001
+status: production
+description: |
+  SAST detection rules for Active Directory Access Control List (ACL) and
+  Access Control Entry (ACE) abuse techniques including WriteDACL, GenericAll,
+  GenericWrite, ForceChangePassword, AddMember, WriteOwner, DCSync rights
+  delegation, Shadow Credentials, and LAPS abuse.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1222.001  # File and Directory Permissions Modification
+  - T1098.001  # Additional Cloud Credentials
+  - T1484.001  # Domain Policy Modification
+  - T1134.005  # SID-History Injection
+  - T1556.006  # Multi-Factor Authentication
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: DCSync Rights Grant via WriteDACL  (T1484.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: acl-dcsync-grant-001
+    title: DCSync Rights Granted to Unprivileged Account via dacledit
+    technique: T1484.001
+    severity: critical
+    description: >
+      Detects modification of domain object DACL to grant DS-Replication
+      permissions to a non-privileged account. Enables DCSync attacks from
+      any machine with that account's credentials.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4662, 5136]
+          conditions:
+            - field: Properties
+              contains_any:
+                - "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"  # DS-Replication-Get-Changes
+                - "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"  # DS-Replication-Get-Changes-All
+    detection:
+      sigma_condition: |
+        EventID=5136 AND
+        AttributeLDAPDisplayName IN ["nTSecurityDescriptor", "msDS-AllowedToActOnBehalfOfOtherIdentity"] AND
+        SubjectUserName NOT IN DA_group_members AND
+        OperationType="Value Added"
+      critical_indicator: |
+        # ACE added for DS-Replication-Get-Changes-All to non-DC computer
+        5136 event WITH nTSecurityDescriptor change AND new ACE containing
+        "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" → CRITICAL ALERT
+    tools_used:
+      - "impacket-dacledit -action write -rights DCSync -principal {user} -target-dn '{base_dn}' {dom}/{user}:{pass}"
+    remediation:
+      - Audit and alert on Event ID 5136 for domain object ACL changes
+      - Restrict WriteDACL permission on domain object to DA only
+      - Monitor dacledit tool execution via process creation events
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: GenericAll/GenericWrite Group Membership Abuse  (T1098)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: acl-group-addmember-001
+    title: Unauthorized Group Membership Addition — GenericAll/GenericWrite Abuse
+    technique: T1098
+    severity: critical
+    description: >
+      Detects adding unauthorized users to privileged groups using GenericAll
+      or GenericWrite ACE over the target group. Enables privilege escalation
+      by adding attacker account to Domain Admins, Enterprise Admins, etc.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4728, 4732, 4756]  # Member added to global/local/universal group
+          conditions:
+            - field: TargetUserName
+              contains_any:
+                - "Domain Admins"
+                - "Enterprise Admins"
+                - "Schema Admins"
+                - "Administrators"
+                - "Account Operators"
+                - "Backup Operators"
+    detection:
+      sigma_condition: |
+        EventID IN [4728, 4732, 4756] AND
+        TargetUserName IN privileged_groups_list AND
+        SubjectUserName NOT IN DA_list AND
+        NOT preceded_by change_control_ticket
+      behavioral_indicators:
+        - User added to DA group by non-DA account
+        - Group membership change outside business hours
+        - Multiple group additions in rapid succession
+    tools_used:
+      - "net rpc group addmem '{grp}' '{user}' -U {dom}\\{user}%{pass} -S {dc}"
+      - "Add-DomainGroupMember -Identity 'Domain Admins' -Members {user}"
+    remediation:
+      - Alert on Event IDs 4728/4732/4756 for sensitive groups immediately
+      - Implement Privileged Identity Management (PIM) for group membership changes
+      - Audit GenericAll/GenericWrite ACEs on privileged groups
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: ForceChangePassword  (T1098)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: acl-forcechangepassword-001
+    title: Force Password Change — ExtendedRight Abuse
+    technique: T1098
+    severity: high
+    description: >
+      Detects forced password changes using ExtendedRight "User-Force-Change-Password"
+      ACE. Attacker changes target account password without knowing current password,
+      enabling account takeover.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4723, 4724]
+          conditions:
+            - field: SubjectUserName
+              not_equals: TargetUserName  # Not a self-password-change
+    detection:
+      sigma_condition: |
+        EventID=4724 AND
+        SubjectUserName != TargetUserName AND
+        SubjectUserName NOT IN ["SYSTEM", "Domain Admins"] AND
+        TargetUserName IN privileged_users_list
+    tools_used:
+      - "impacket-changepasswd {dom}/{victim}@{dc} -newpass '{newpass}' -altuser {user} -altpass '{pass}'"
+      - "Set-DomainUserPassword -Identity {victim} -AccountPassword (ConvertTo-SecureString '{pass}' -AsPlainText -Force)"
+      - "net rpc password {victim} '{newpass}' -U {dom}\\{user}%{pass} -S {dc}"
+    remediation:
+      - Audit User-Force-Change-Password ACE on all user objects
+      - Alert on Event ID 4724 where subject != target
+      - Implement time-based alerting for off-hours password changes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Shadow Credentials — msDS-KeyCredentialLink Injection  (T1556.006)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: acl-shadow-credentials-001
+    title: Shadow Credentials — msDS-KeyCredentialLink Attribute Injection
+    technique: T1556.006
+    severity: critical
+    description: >
+      Detects injection of attacker-controlled key into msDS-KeyCredentialLink
+      attribute (Windows Hello for Business). Enables Kerberos pre-auth using
+      certificate without knowing account password. Works via certipy shadow auto.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [5136]
+          conditions:
+            - field: AttributeLDAPDisplayName
+              value: "msDS-KeyCredentialLink"
+            - field: OperationType
+              value: "Value Added"
+    detection:
+      sigma_condition: |
+        EventID=5136 AND
+        AttributeLDAPDisplayName="msDS-KeyCredentialLink" AND
+        OperationType="Value Added" AND
+        SubjectUserName NOT IN ["SYSTEM", whfb_enrollment_service_accounts]
+      behavioral_indicators:
+        - msDS-KeyCredentialLink modified by non-system account
+        - Multiple accounts targeted in short timeframe
+        - Modification from non-domain-joined host
+    tools_used:
+      - "certipy shadow auto -u {user}@{dom} -p {pass} -account '{target}' -dc-ip {dc}"
+      - "pywhfb -target {target} -dc-ip {dc} -u {user} -p {pass}"
+      - "Whisker.exe add /target:{target}"
+    remediation:
+      - Alert on any msDS-KeyCredentialLink modification (Event 5136)
+      - Restrict write access to msDS-KeyCredentialLink attribute
+      - Enable audit logging for AD attribute changes (Advanced Audit Policy)
+      - Monitor for Certipy / Whisker tool execution
+    references:
+      - https://attack.mitre.org/techniques/T1556/006/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Computer Account Creation for RBCD  (T1098.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: acl-add-computer-001
+    title: Computer Account Creation via MachineAccountQuota
+    technique: T1098.001
+    severity: high
+    description: >
+      Detects creation of computer accounts by non-privileged users exploiting
+      the default MachineAccountQuota=10. Used as prerequisite for RBCD attacks
+      and other computer-account-dependent escalations.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4741]  # Computer account created
+          conditions:
+            - field: SubjectUserName
+              not_in: ["SYSTEM", "Domain Admins group members"]
+    detection:
+      sigma_condition: |
+        EventID=4741 AND
+        SubjectUserName NOT IN [SYSTEM, DA_accounts] AND
+        NewComputerAccountName ENDSWITH "$" AND
+        SubjectUserName NOT IN computer_deployment_accounts
+      anomaly:
+        - Non-privileged account creating computer accounts
+        - Multiple computer accounts created by same user in short period
+        - Computer account name matching attack tools (RBCDCOMP, EVILCOMP)
+    tools_used:
+      - "impacket-addcomputer -computer-name '{comp}$' -computer-pass '{pass}' {dom}/{user}:{pass} -dc-ip {dc}"
+      - "New-MachineAccount -MachineAccount {comp} -Password (ConvertTo-SecureString '{pass}' -AsPlainText -Force)"
+    remediation:
+      - Set MachineAccountQuota to 0 (prevents non-admin computer account creation)
+      - "Set-ADDomain -Identity {domain} -Replace @{'ms-DS-MachineAccountQuota'=0}"
+      - Monitor Event ID 4741 for unexpected computer account creation
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: LAPS Password Read — Unauthorized Access  (T1552.006)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: acl-laps-read-001
+    title: Unauthorized LAPS Password Read via LDAP
+    technique: T1552.006
+    severity: high
+    description: >
+      Detects unauthorized reading of ms-Mcs-AdmPwd (LAPS password) attribute
+      from Active Directory. Provides local admin credentials for LAPS-managed
+      computers.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4662]
+          conditions:
+            - field: Properties
+              contains: "ms-Mcs-AdmPwd"
+    detection:
+      sigma_condition: |
+        EventID=4662 AND
+        Properties CONTAINS "ms-Mcs-AdmPwd" AND
+        SubjectUserName NOT IN laps_authorized_readers_list
+    tools_used:
+      - "nxc ldap {dc} -u {user} -p {pass} -d {dom} -M laps"
+      - "ldapsearch -b '{base_dn}' '(ms-Mcs-AdmPwd=*)' ms-Mcs-AdmPwd cn"
+      - "Get-LAPSPasswords -DomainController {dc} -Credential {creds}"
+    remediation:
+      - Enable LAPS attribute access auditing
+      - Restrict ms-Mcs-AdmPwd read permissions to authorized groups only
+      - Rotate LAPS passwords immediately after suspected compromise
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: BloodHound Collection — ACL Enumeration  (T1087.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: acl-bloodhound-001
+    title: BloodHound LDAP Collection — ACL Enumeration for Attack Path Discovery
+    technique: T1087.002
+    severity: high
+    description: >
+      Detects BloodHound data collection which queries all AD objects, ACLs,
+      group memberships, and computer sessions via LDAP. Creates large number
+      of LDAP queries in short time.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4662]
+    network_indicators:
+      - destination_port: 389
+        protocol: LDAP
+        query_volume: "> 1000 queries in 60 seconds"
+    detection:
+      sigma_condition: |
+        EventID=4662 AND count() by SubjectUserName > 1000 within 60s AND
+        SubjectUserName NOT IN authorized_collectors_list
+      ldap_filter_indicators:
+        - "(objectClass=*)"
+        - "(objectCategory=group)"
+        - "(objectCategory=computer)"
+        - "(&(objectCategory=person)(objectClass=user))"
+        - "(userAccountControl:1.2.840.113556.1.4.803:=524288)"  # Unconstrained delegation enum
+    tools_used:
+      - "bloodhound-python -u {user} -p {pass} -d {dom} -dc {dc} -c All --zip"
+      - "SharpHound.exe -c All --zipfilename bh.zip"
+    remediation:
+      - Monitor for bulk LDAP queries from non-DC hosts
+      - Implement Microsoft Defender for Identity BloodHound detection
+      - Deploy AD Canary objects that alert on enumeration
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/acl_abuse.py
+  rules:
+    - id: sast-code-acl-001
+      title: ldapsearch Password in Command Line
+      severity: high
+      pattern: |
+        ldapsearch.*-w '{pw}'
+      description: >
+        LDAP bind password passed as command-line argument visible in process list.
+        Consider using ldapsearch with -y (password file) or SASL authentication.
+      recommendation: "Use '-y /tmp/ldap.pw' with a temporary file, or use Kerberos SASL"
+
+    - id: sast-code-acl-002
+      title: net rpc Command Exposes Credentials
+      severity: high
+      pattern: |
+        net rpc.*-U.*%{pw}
+      description: >
+        Password passed to net rpc in {user}%{password} format — visible in
+        process list. Consider using Kerberos ticket authentication instead.
+
+    - id: sast-code-acl-003
+      title: Missing Input Validation on Group/User Names
+      severity: medium
+      pattern: |
+        grp\s+=\s+prompt\("Target group"\)
+      description: >
+        Group name from user input not validated before being passed to net rpc
+        command. Malformed input could cause unexpected command behavior.
+      recommendation: "Validate group name against AD group list before use"

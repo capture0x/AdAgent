@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "nightshade": {
+      "command": "venv/bin/python3",
+      "args": ["mcp_server.py"],
+      "env": {}
+    }
+  }
+}

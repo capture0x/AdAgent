@@ -1,23 +1,8 @@
 """
 utils/helpers.py
-AdStrike — Professional UI / UX helpers
+NightShade — Professional UI / UX helpers (synthwave theme)
 """
 import subprocess, sys, os, json, datetime, threading, time, shutil, shlex
-
-# ── 16-color ANSI ─────────────────────────────────────────────────────────────
-R    = "\033[38;2;253;38;54m"    # AdStrike red
-G    = "\033[92m"     # green
-Y    = "\033[93m"     # yellow
-B    = "\033[38;5;45m"            # AdStrike blue
-M    = "\033[38;2;253;38;54m"    # AdStrike red
-C    = "\033[38;5;45m"            # AdStrike blue
-W    = "\033[97m"     # white
-DIM  = "\033[2m"
-BOLD = "\033[1m"
-ITAL = "\033[3m"
-UND  = "\033[4m"
-BLINK= "\033[5m"
-RST  = "\033[0m"
 
 # ── ANSI palettes for brand effects ───────────────────────────────────────────
 def fg(n):  return f"\033[38;5;{n}m"
@@ -25,29 +10,64 @@ def bg(n):  return f"\033[48;5;{n}m"
 def fg_rgb(r, g, b): return f"\033[38;2;{r};{g};{b}m"
 def bg_rgb(r, g, b): return f"\033[48;2;{r};{g};{b}m"
 
-# AdStrike brand theme: #FD2636 red, legacy terminal blue, white.
-ADSTRIKE_RED  = fg_rgb(253, 38, 54)
-ADSTRIKE_BLUE = fg(45)
+# ── NightShade synthwave palette ──────────────────────────────────────────────
+# cyan   #2DE2E6 — primary labels / info        violet #B967FF — accent / borders
+# mint   #36F1CD — success / ready              pink   #FF6AC1 — error / high
+# hotred #FF3864 — critical                     amber  #FFC400 — warning / medium
+# lavender-white #EAE6FF — text / values        dim slate #8B83A8 — secondary
+_NS_CYAN   = fg_rgb(45, 226, 230)
+_NS_VIOLET = fg_rgb(185, 103, 255)
+_NS_MINT   = fg_rgb(54, 241, 205)
+_NS_PINK   = fg_rgb(255, 106, 193)
+_NS_HOTRED = fg_rgb(255, 56, 100)
+_NS_AMBER  = fg_rgb(255, 196, 0)
+_NS_WHITE  = fg_rgb(234, 230, 255)
+_NS_SOFT   = fg_rgb(201, 195, 230)
+_NS_SLATE  = fg_rgb(139, 131, 168)
 
-BABY_BLUE   = ADSTRIKE_BLUE
-SKY_BLUE    = ADSTRIKE_BLUE
-LIGHT_PINK  = ADSTRIKE_RED
-SOFT_PINK   = ADSTRIKE_RED
-PURE_WHITE  = fg(255)
-SOFT_WHITE  = fg(252)
-MIST        = ADSTRIKE_BLUE
-SLATE       = fg(245)
-STEEL       = fg(250)
-SILVER      = fg(255)
+# ── 16-color ANSI shorthands (kept for back-compat; remapped to synthwave) ────
+R    = _NS_PINK      # accent/error
+G    = _NS_MINT      # success
+Y    = _NS_AMBER     # warning
+B    = _NS_CYAN      # info/primary
+M    = _NS_VIOLET    # secondary accent
+C    = _NS_CYAN      # primary
+W    = _NS_WHITE     # text
+DIM  = "\033[2m"
+BOLD = "\033[1m"
+ITAL = "\033[3m"
+UND  = "\033[4m"
+BLINK= "\033[5m"
+RST  = "\033[0m"
 
-NEON_RED    = ADSTRIKE_RED
-NEON_ORG    = LIGHT_PINK
-NEON_YEL    = fg(230)
-NEON_GRN    = BABY_BLUE
-NEON_CYN    = BABY_BLUE
-NEON_BLU    = SKY_BLUE
-NEON_PUR    = LIGHT_PINK
-NEON_PNK    = SOFT_PINK
+# NightShade brand theme — every named color below is an alias kept intact so all
+# downstream modules keep compiling; only the hues change.
+ADSTRIKE_RED  = _NS_PINK       # brand accent / error base
+ADSTRIKE_BLUE = _NS_CYAN       # brand primary / labels
+
+# Kept as aliases so new modules compile cleanly
+ADSTRIKE_PINK   = _NS_PINK
+ADSTRIKE_PURPLE = _NS_VIOLET
+
+BABY_BLUE   = _NS_MINT          # success [+]
+SKY_BLUE    = _NS_CYAN          # info [*]
+LIGHT_PINK  = _NS_VIOLET        # borders / prompt / error accent
+SOFT_PINK   = _NS_PINK          # high severity
+PURE_WHITE  = _NS_WHITE
+SOFT_WHITE  = _NS_SOFT
+MIST        = _NS_CYAN
+SLATE       = _NS_SLATE
+STEEL       = fg_rgb(170, 160, 200)
+SILVER      = _NS_WHITE
+
+NEON_RED    = _NS_HOTRED        # critical
+NEON_ORG    = _NS_VIOLET        # CMD label
+NEON_YEL    = _NS_AMBER         # warn / medium
+NEON_GRN    = _NS_MINT          # progress / success
+NEON_CYN    = _NS_CYAN          # section headers / spinner
+NEON_BLU    = _NS_CYAN
+NEON_PUR    = _NS_VIOLET
+NEON_PNK    = _NS_PINK
 
 SEV_COLOR = {
     "Critical": LIGHT_PINK + BOLD,
@@ -62,7 +82,7 @@ def cprint(msg, color=W): print(f"{color}{msg}{RST}")
 def success(msg):         print(f"  {BABY_BLUE}[+]{RST} {msg}")
 def warn(msg):            print(f"  {Y}[!]{RST} {msg}")
 def info(msg):            print(f"  {SKY_BLUE}[*]{RST} {msg}")
-def error(msg):           print(f"  {LIGHT_PINK}[-]{RST} {msg}")
+def error(msg):           print(f"  {SOFT_PINK}[-]{RST} {msg}")
 def debug(msg):           print(f"  {DIM}[.]{RST} {DIM}{msg}{RST}")
 def critical(msg):        print(f"  {NEON_RED}{BOLD}[!!]{RST} {NEON_RED}{msg}{RST}")
 def prompt(msg):          return input(f"  {LIGHT_PINK}[?]{RST} {msg}: ").strip()
@@ -312,8 +332,24 @@ def save_result(data, filename, subdir=""):
     success(f"Saved → {NEON_CYN}{path}{RST}")
     return path
 
-def add_finding(name, severity, description, recommendation, evidence=""):
+# Evidence-grade proof levels (ordered weakest → strongest). A finding's
+# proof_level states how strongly it was established, so a report can separate
+# "we saw a service" from "we exploited it and own the host".
+PROOF_LEVELS = ("observed", "validated", "exploitable", "exploited", "owned")
+
+
+def add_finding(name, severity, description, recommendation, evidence="",
+                proof_level="observed", command=""):
+    """Record a finding.
+
+    New (additive, optional) evidence-grade fields — existing callers are
+    unaffected since these default:
+      proof_level: how strongly it was established (see PROOF_LEVELS).
+      command:     the exact command/tool invocation that produced the evidence.
+    """
     from config.settings import SESSION
+    if proof_level not in PROOF_LEVELS:
+        proof_level = "observed"
     key = (
         str(name).strip().lower(),
         str(severity).strip().lower(),
@@ -328,6 +364,17 @@ def add_finding(name, severity, description, recommendation, evidence=""):
             str(existing.get("recommendation", "")).strip().lower(),
         )
         if existing_key == key:
+            # Keep the STRONGEST proof level / fill missing evidence on a repeat.
+            try:
+                if PROOF_LEVELS.index(proof_level) > PROOF_LEVELS.index(
+                        existing.get("proof_level", "observed")):
+                    existing["proof_level"] = proof_level
+            except ValueError:
+                pass
+            if command and not existing.get("command"):
+                existing["command"] = command
+            if evidence and not existing.get("evidence"):
+                existing["evidence"] = evidence
             debug(f"Duplicate finding skipped: {name}")
             return existing
 
@@ -338,10 +385,13 @@ def add_finding(name, severity, description, recommendation, evidence=""):
         "description": description,
         "recommendation": recommendation,
         "evidence": evidence,
+        "proof_level": proof_level,
+        "command": command,
         "timestamp": str(datetime.datetime.now()),
     })
     color = SEV_COLOR.get(severity, W)
-    print(f"  {color}[FINDING] [{severity:<8}]{RST} {BOLD}{name}{RST}")
+    _pl = f" {DIM}({proof_level}){RST}" if proof_level != "observed" else ""
+    print(f"  {color}[FINDING] [{severity:<8}]{RST} {BOLD}{name}{RST}{_pl}")
     return SESSION["findings"][-1]
 
 def dedupe_findings(findings=None):

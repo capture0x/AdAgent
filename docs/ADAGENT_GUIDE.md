@@ -16,10 +16,14 @@ AdAgent is a standalone AI-powered Active Directory attack orchestrator. It wrap
 
 Unlike interactive frameworks, AdAgent makes its own decisions about which tool to run next based on what it has discovered, tracks evidence across rounds, adapts when paths fail, and produces structured reports.
 
+> **MCP server path:** AdAgent can also run as a [Model Context Protocol](https://modelcontextprotocol.io)
+> tool server inside **Claude Code / Cursor / Claude Desktop** — exposing all 53 tools with **no API key
+> and no local model** (the host LLM is the brain). See [`docs/mcp.md`](mcp.md).
+
 **Key capabilities:**
 - 59 specialised attack tools covering the full AD kill chain
 - 139 attack techniques in 22 SAST categories loaded into the agent's system prompt
-- Two AI backends: Ollama (local, free, offline) and Anthropic Claude (API)
+- Three ways to drive it: Ollama (local, free, offline), Anthropic Claude (API), or as an **MCP server** (host LLM, no key) — see [`docs/mcp.md`](mcp.md)
 - Kerberos-first design for NTLM-disabled environments
 - Dead-path tracking per principal — no wasted loops
 - OPSEC modes: `loud`, `normal`, `stealth`

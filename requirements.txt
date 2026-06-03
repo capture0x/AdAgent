@@ -3,21 +3,29 @@
 # Or run: ./install.sh
 
 # ── Core ──────────────────────────────────────────────────────
-impacket>=0.12.0
+impacket>=0.13.0
 ldap3>=2.9.1
 dnspython>=2.4.0
 pyasn1>=0.5.0
 pycryptodome>=3.19.0
 
-# ── AI Backend ────────────────────────────────────────────────
-anthropic>=0.40.0        # Claude API (optional — Ollama is free alternative)
-requests>=2.31.0         # Ollama local API
-
 # ── Reporting ─────────────────────────────────────────────────
 jinja2>=3.1.2
 markdown>=3.5.1
+xlsxwriter>=3.2.0
+
+# ── AD CS (ESC1-13) — certipy built-in ────────────────────────
+certipy-ad>=4.8.2
+
+# ── AI Agent ──────────────────────────────────────────────────
+anthropic>=0.40.0        # Claude API (optional — Ollama is free alternative)
+requests>=2.31.0         # Ollama local API
+mcp>=1.0.0               # MCP server for Claude Code / Cursor / Claude Desktop
 
 # ── Utility ───────────────────────────────────────────────────
 colorama>=0.4.6
 python-dotenv>=1.0.0
 chardet<6
+
+# NOTE: bloodhound, netexec, evil-winrm, kerbrute and other AD tooling are
+# installed by ./install.sh (apt + pip + pipx), not pinned here — see install.sh.

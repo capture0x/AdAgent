@@ -7,13 +7,14 @@
   <img src="https://img.shields.io/badge/techniques-139-00B4D8?style=flat-square&labelColor=0d0d1a" alt="139 Techniques"/>
   <img src="https://img.shields.io/badge/SAST-22%20categories-06D6A0?style=flat-square&labelColor=0d0d1a" alt="22 Categories"/>
   <img src="https://img.shields.io/badge/AI-Ollama%20%7C%20Claude-7B2FBE?style=flat-square&labelColor=0d0d1a" alt="AI Backends"/>
+  <img src="https://img.shields.io/badge/MCP-server-FF6AC1?style=flat-square&labelColor=0d0d1a" alt="MCP Server"/>
   <img src="https://img.shields.io/badge/python-3.8+-00B4D8?style=flat-square&labelColor=0d0d1a" alt="Python"/>
   <img src="https://img.shields.io/badge/license-MIT-06D6A0?style=flat-square&labelColor=0d0d1a" alt="License"/>
 </p>
 
 <p align="center">
   <b>AI-Powered Active Directory Attack Agent</b><br/>
-  <sub>59 tools · 139 techniques · Autonomous kill-chain execution · Ollama + Claude</sub>
+  <sub>59 tools · 139 techniques · Autonomous kill-chain execution · Ollama + Claude · MCP server</sub>
 </p>
 
 ---
@@ -26,6 +27,42 @@
 ## Overview
 
 **AdAgent** is a standalone autonomous agent that chains Active Directory offensive techniques automatically using an AI backend (Ollama or Claude). It drives the full kill chain — from initial enumeration through domain compromise — without manual intervention, while tracking evidence, adapting to dead paths, and producing structured pentest reports.
+
+It runs in **three modes**:
+
+| Mode | Brain | Cost | How |
+|---|---|---|---|
+| **Ollama** | local model | free, offline | `./run.sh` → backend `[1]` |
+| **Claude** | Anthropic API | your API key | `./run.sh` → backend `[2]` |
+| **MCP server** ⭐ | **your Claude Code / Cursor / Claude Desktop** | **no API key, no local model** | register `mcp_server.py` |
+
+---
+
+## 🔌 MCP Server — drive AdAgent from Claude Code / Cursor (no API key)
+
+> **No `ANTHROPIC_API_KEY`. No Ollama. No local model.** AdAgent exposes all **53 tools**
+> (the 52 attack tools **+ `set_engagement`**) over the [Model Context Protocol](https://modelcontextprotocol.io).
+> A host that already has an LLM — **Claude Code, Cursor, Claude Desktop** — becomes the brain and
+> funds the reasoning from its **own subscription**. The host decides which tool to call; AdAgent is the toolbox.
+
+The repo ships a ready `.mcp.json`, so from the project folder it's one approval:
+
+```bash
+cd AdAgent
+claude                      # launches Claude Code; approve the "adagent" server on first run
+# …or register globally from anywhere:
+claude mcp add adagent -- /path/to/AdAgent/venv/bin/python3 /path/to/AdAgent/mcp_server.py
+```
+
+Then set the engagement once and let the host drive the kill chain:
+
+> `set_engagement: dc_ip 10.0.0.1, domain corp.local, username alice, password …`
+> *"run nmap, enumerate LDAP, collect BloodHound, and find the shortest path to Domain Admin."*
+
+AdAgent injects the target + credentials into every later call, so the model never repeats the
+password and can't target the wrong host. Credentials and reasoning never leave your host.
+
+📖 **Full setup (Claude Code · Cursor · Claude Desktop), tool map, and usage:** [`docs/mcp.md`](docs/mcp.md)
 
 ## Main Menu
 
@@ -429,9 +466,8 @@ pip install bloodyad lsassy dploot roadtx roadrecon sccmhunter pywsus
 
 ## Documentation
 
-Full operator guide: [`docs/ADAGENT_GUIDE.md`](docs/ADAGENT_GUIDE.md)
-
-Covers: session model, all 59 tools, SAST knowledge base, decision engine priority ladder, gMSA/ADCS/BloodHound/ADFS/WSUS/Trust workflows, loop guards, troubleshooting, development guidelines, and operator checklist.
+- **Operator guide:** [`docs/ADAGENT_GUIDE.md`](docs/ADAGENT_GUIDE.md) — session model, all 59 tools, SAST knowledge base, decision engine priority ladder, gMSA/ADCS/BloodHound/ADFS/WSUS/Trust workflows, loop guards, troubleshooting, development guidelines, and operator checklist.
+- **MCP server:** [`docs/mcp.md`](docs/mcp.md) — run AdAgent as a tool server inside Claude Code / Cursor / Claude Desktop with **no API key and no local model** (register, set the engagement, the 53-tool map, usage).
 
 ---
 
@@ -442,6 +478,7 @@ AdAgent is the agent-only extraction of **[AdStrike](https://github.com/capture0
 | | AdAgent | AdStrike |
 |---|---|---|
 | AI Agent | ✅ Full (59 tools) | ✅ Full |
+| MCP server (Claude Code / Cursor) | ✅ 53 tools, no API key | ✅ |
 | Interactive Modules | ❌ | ✅ 56 modules |
 | Best for | Autonomous runs | Manual + AI hybrid |
 

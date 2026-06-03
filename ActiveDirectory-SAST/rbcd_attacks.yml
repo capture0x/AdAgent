@@ -1,0 +1,222 @@
+title: AdStrike - RBCD (Resource-Based Constrained Delegation) Detection Rules
+id: sast-rbcd-001
+status: production
+description: |
+  SAST detection rules for Resource-Based Constrained Delegation (RBCD)
+  attack techniques including the MAQ-to-psexec full chain, NTLM relay
+  delegate-access, Bronze Bit (CVE-2020-17049), Shadow Credentials combo,
+  S4U2Self abuse, and Powermad computer account creation.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1134.001  # Token Impersonation/Theft
+  - T1098.001  # Additional Cloud Credentials
+  - T1550.003  # Pass the Ticket
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: RBCD Full Chain — MAQ Exploit  (T1134.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: rbcd-full-chain-001
+    title: RBCD Full Chain — MachineAccountQuota to Computer Account Compromise
+    technique: T1134.001
+    severity: critical
+    description: >
+      Full RBCD attack: (1) Create fake computer via MAQ, (2) Write fake computer
+      SID to target's msDS-AllowedToActOnBehalfOfOtherIdentity, (3) Use S4U2Self
+      to impersonate DA to target service, (4) Use S4U2Proxy to get service ticket.
+      Results in full control of target computer as Administrator.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4741, 5136, 4769]
+    detection:
+      chain_detection:
+        step1:
+          event: "4741"
+          condition: "Non-admin creates computer account (MAQ abuse)"
+          sigma: |
+            EventID=4741 AND SubjectUserName NOT IN admin_accounts AND
+            count(NewComputerAccount) by SubjectUserName > 0
+        step2:
+          event: "5136"
+          condition: "msDS-AllowedToActOnBehalfOfOtherIdentity set on target"
+          sigma: |
+            EventID=5136 AND
+            AttributeLDAPDisplayName="msDS-AllowedToActOnBehalfOfOtherIdentity" AND
+            OperationType="Value Added"
+        step3:
+          event: "4769"
+          condition: "S4U2Self TGS request for impersonated user"
+          sigma: |
+            EventID=4769 AND
+            ServiceName ENDSWITH "$" AND
+            TicketOptions CONTAINS "s4u"
+      combined_alert: |
+        IF (4741 by user X) THEN (5136 on computer Y by user X or X's computer) WITHIN 30m
+        → RBCD ATTACK HIGH CONFIDENCE
+    tools_used:
+      - "impacket-addcomputer -computer-name '{comp}$' -computer-pass '{pass}' {dom}/{user}:{pass} -dc-ip {dc}"
+      - "impacket-rbcd -f {comp} -t {victim} {dom}/{user}:{pass}"
+      - "impacket-getST -spn cifs/{victim}.{dom} -impersonate Administrator {dom}/{comp}$:{comp_pass} -dc-ip {dc}"
+      - "impacket-psexec {dom}/Administrator@{victim} -k -no-pass"
+    remediation:
+      - Set MachineAccountQuota to 0 (Critical — prevents all MAQ-based RBCD)
+      - Alert on msDS-AllowedToActOnBehalfOfOtherIdentity modifications (Event 5136)
+      - Monitor for sequence: 4741 → 5136 within short timeframe
+      - Enable "Audit DS Changes" for object modification events
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: RBCD via NTLM Relay  (T1557 + T1134.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: rbcd-ntlm-relay-001
+    title: RBCD via NTLM Relay — --delegate-access Flag
+    technique: T1557
+    severity: critical
+    description: >
+      impacket-ntlmrelayx --delegate-access automatically performs RBCD attack
+      during relay: creates computer account and sets RBCD on victim computer
+      in single operation. Most automated RBCD attack path.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4741, 5136]
+    detection:
+      sigma_condition: |
+        EventID=4741 AND SubjectUserName ENDSWITH "$" AND  # Computer account creating another
+        WITHIN 30s FOLLOWED_BY
+        EventID=5136 AND AttributeLDAPDisplayName="msDS-AllowedToActOnBehalfOfOtherIdentity"
+      behavioral:
+        - LDAP modification of msDS-AllowedToActOnBehalfOfOtherIdentity during relay session
+        - Computer account created immediately followed by delegation write
+    tools_used:
+      - "impacket-ntlmrelayx -t ldap://{dc} -smb2support --delegate-access"
+    remediation:
+      - Enable LDAP signing (prevents relay to LDAP)
+      - Enable SMB signing on all hosts
+      - Set MachineAccountQuota to 0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Bronze Bit — CVE-2020-17049  (T1134.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: rbcd-bronze-bit-001
+    title: Bronze Bit — CVE-2020-17049 Constrained Delegation Bypass
+    technique: T1134.001
+    severity: critical
+    description: >
+      CVE-2020-17049 (Bronze Bit) bypasses the constrained delegation restriction
+      on forwarding non-forwardable service tickets. Allows S4U2Proxy with
+      tickets that should not be forwardable. Patched in November 2020.
+    detection:
+      sigma_condition: |
+        EventID=4769 AND
+        TicketOptions CONTAINS "0x40810010" AND  # Non-forwardable flag + S4U
+        ServiceName ENDSWITH "$" AND
+        SystemTime > "2020-11-10"  # Patched after this date — if still seen, unpatched system
+      vulnerability_indicators:
+        - Host running Windows < November 2020 patches
+        - S4U2Proxy with non-forwardable service ticket from constrained account
+    tools_used:
+      - "impacket-getST -spn cifs/{target} -impersonate Administrator -force-forwardable {dom}/{svc}:{pass}"
+      - "Rubeus.exe s4u /bronzebit /impersonateuser:Admin /msdsspn:cifs/{target} /ptt"
+    remediation:
+      - Apply November 2020 Kerberos security updates (KB4586786)
+      - Monitor S4U2Proxy requests with non-forwardable tickets
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: S4U2Self Abuse  (T1134.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: rbcd-s4u2self-001
+    title: S4U2Self — Service Account Impersonation via Protocol Transition
+    technique: T1134.001
+    severity: high
+    description: >
+      S4U2Self (Protocol Transition) allows a service account with trusted for
+      delegation to request a service ticket to itself on behalf of any user.
+      Used as first step before S4U2Proxy or standalone for token impersonation.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4769]
+    detection:
+      sigma_condition: |
+        EventID=4769 AND
+        ServiceName == TargetUser AND  # Account requesting ticket to itself
+        TicketOptions CONTAINS "s4u" AND
+        TargetUser NOT IN expected_service_accounts
+      behavioral:
+        - Service account requesting ticket to itself for DA account
+        - S4U2Self for Administrator/krbtgt accounts
+    remediation:
+      - Enable "Account is sensitive and cannot be delegated" for DA accounts
+      - Monitor S4U2Self requests for privileged accounts
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Cleanup — RBCD Removal  (Defensive Detection)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: rbcd-cleanup-001
+    title: RBCD Cleanup — Attacker Removes Evidence (msDS-AllowedToActOnBehalfOfOtherIdentity)
+    technique: T1070
+    severity: high
+    description: >
+      After RBCD attack, attacker cleans up by removing msDS-AllowedToActOnBehalfOfOtherIdentity
+      and deleting fake computer account. Removal of these indicators is itself suspicious.
+    detection:
+      sigma_condition: |
+        (EventID=5136 AND AttributeLDAPDisplayName="msDS-AllowedToActOnBehalfOfOtherIdentity" AND
+         OperationType="Value Deleted") OR
+        (EventID=4743 AND  # Computer account deleted
+         SubjectUserName NOT IN computer_lifecycle_management_accounts)
+    remediation:
+      - Alert on BOTH setting AND removal of delegation attributes
+      - Retain AD change history in SIEM for 90+ days
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Powermad — Machine Account Creation (Windows side)  (T1136.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: rbcd-powermad-001
+    title: Powermad — New-MachineAccount Computer Creation via LDAP
+    technique: T1136.002
+    severity: high
+    description: >
+      Powermad.ps1 New-MachineAccount creates computer accounts via direct LDAP
+      without needing local admin or Active Directory Users and Computers.
+      Exploits MachineAccountQuota default of 10.
+    event_sources:
+      - powershell_eventlog:
+          event_ids: [4104]
+    detection:
+      sigma_condition: |
+        EventID=4104 AND ScriptBlockText CONTAINS ANY [
+          "New-MachineAccount",
+          "Powermad",
+          "MachineAccountQuota"
+        ]
+    tools_used:
+      - "Import-Module .\\Powermad.ps1; New-MachineAccount -MachineAccount {comp} -Password (ConvertTo-SecureString '{pass}' -AsPlainText -Force)"
+    remediation:
+      - Set MachineAccountQuota = 0 (elimnates Powermad attack path)
+      - Monitor for New-MachineAccount PowerShell execution
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/rbcd_attacks.py
+  rules:
+    - id: sast-code-rbcd-001
+      title: Default Computer Password Hardcoded — Weak Default
+      severity: high
+      pattern: |
+        comp_pass\s*=\s*prompt\(.*\)\s+or\s+"P@ss1234!"
+      description: >
+        Default computer account password "P@ss1234!" used if operator doesn't
+        provide one. This predictable password could allow other actors to
+        authenticate as the fake computer account.
+      recommendation: "Generate cryptographically random password: import secrets; default_pass = secrets.token_urlsafe(24)"
+
+    - id: sast-code-rbcd-002
+      title: Computer Account Name Default Could Conflict
+      severity: low
+      pattern: |
+        comp_name\s*=\s*prompt\(.*\)\s+or\s+"RBCDCOMP"
+      description: >
+        Default computer name "RBCDCOMP" is easily identifiable as RBCD attack
+        artifact. Operators should use less obvious names for OPSEC.

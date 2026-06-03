@@ -1,0 +1,169 @@
+title: AdStrike - DCSync / DCShadow Detection Rules
+id: sast-dcsync-001
+status: production
+description: |
+  SAST detection rules for DCSync and DCShadow attacks. DCSync mimics
+  domain controller replication to extract credentials. DCShadow registers
+  a rogue DC to push malicious AD changes that bypass SIEM logging.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1003.003  # OS Credential Dumping: NTDS
+  - T1207      # Rogue Domain Controller (DCShadow)
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: DCSync — All Hashes  (T1003.003)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: dcsync-all-hashes-001
+    title: DCSync — Full Domain Hash Dump via Replication Protocol
+    technique: T1003.003
+    severity: critical
+    description: >
+      DCSync uses MS-DRSR (Directory Replication Service Remote Protocol) to
+      request password data as if replicating from a DC. Requires
+      DS-Replication-Get-Changes-All privilege. Extracts NTLM hashes for
+      all domain accounts including krbtgt.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4662]
+          conditions:
+            - field: Properties
+              contains_any:
+                - "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"  # DS-Replication-Get-Changes
+                - "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"  # DS-Replication-Get-Changes-All
+    detection:
+      critical_rule: |
+        EventID=4662 AND
+        Properties CONTAINS "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" AND
+        SubjectUserName NOT IN DC_computer_accounts AND
+        SubjectDomainName NOT IN [dom+"$"]
+        → CRITICAL: DCSync from non-DC source
+      sigma_condition: |
+        EventID=4662 AND
+        Properties CONTAINS ANY [
+          "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2",
+          "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2",
+          "89e95b76-444d-4c62-991a-0facbeda640c"
+        ] AND
+        SubjectUserName NOT ENDSWITH "$" AND
+        NOT SubjectUserName IN dc_computer_accounts
+    tools_used:
+      - "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-ntlm -outputfile /tmp/dcsync_all"
+      - "mimikatz lsadump::dcsync /all /csv"
+      - "Invoke-Mimi -Command '\"lsadump::dcsync /user:{dom}\\krbtgt\"'"
+    remediation:
+      - Audit DS-Replication-Get-Changes ACE on domain object
+      - Deploy Microsoft Defender for Identity DCSync alert
+      - Monitor Event 4662 with replication GUIDs from non-DCs (immediate alert)
+      - Alert on secretsdump/lsadump output files in /tmp
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: DCSync — Targeted User  (T1003.003)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: dcsync-targeted-001
+    title: DCSync — Targeted Account Replication (krbtgt / Administrator)
+    technique: T1003.003
+    severity: critical
+    description: >
+      Targeted DCSync requesting specific accounts (krbtgt, Administrator).
+      More stealthy than full dump — fewer 4662 events generated.
+    detection:
+      sigma_condition: |
+        EventID=4662 AND
+        Properties CONTAINS "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" AND
+        ObjectName CONTAINS ANY ["krbtgt", "Administrator", "SYSTEM"] AND
+        SubjectUserName NOT ENDSWITH "$"
+    tools_used:
+      - "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-user {target}"
+      - "mimikatz lsadump::dcsync /user:{dom}\\krbtgt"
+    remediation:
+      - Same as DCSync-all-001
+      - Alert specifically when krbtgt or DA accounts are targeted via replication
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: DCShadow — Rogue DC Injection  (T1207)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: dcsync-dcshadow-001
+    title: DCShadow — Rogue Domain Controller Registration for Stealth AD Modification
+    technique: T1207
+    severity: critical
+    description: >
+      DCShadow temporarily registers attacker machine as a Domain Controller using
+      Mimikatz. Allows pushing arbitrary AD changes (group membership, SID history,
+      password hash) that appear as legitimate DC replication — bypasses most
+      SIEM auditing. Requires two simultaneous Mimikatz instances (SYSTEM + DA).
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4662, 5136]
+      - system_eventlog:
+          event_ids: [4929]  # AD replication session started
+    detection:
+      sigma_condition: |
+        (EventID=4662 AND SubjectUserName NOT IN dc_accounts AND
+         Properties CONTAINS "DS-Replication") OR
+        (EventID=5136 AND
+         AttributeLDAPDisplayName IN ["serverReference","nTDSSettings"] AND
+         ObjectDN CONTAINS "CN=Configuration") OR
+        (New machine registered in CN=Sites,CN=Configuration with nTDSDSA class)
+      behavioral_indicators:
+        - Non-DC registering as DC in Sites/Configuration partition
+        - Short-lived DC entry that appears and disappears within minutes
+        - Replication from IP not in known DC list
+    tools_used:
+      - "# Window 1 (as SYSTEM): mimikatz lsadump::dcshadow /object:CN=... /attribute:... /value:..."
+      - "# Window 2 (as DA): mimikatz lsadump::dcshadow /push"
+    remediation:
+      - Monitor CN=Configuration for new nTDSDSA objects (rogue DC registration)
+      - Alert on DCShadow via Microsoft Defender for Identity
+      - Monitor for unexpected replication sources in Event 4929
+      - Audit AD configuration partition changes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: DCSync Rights Check  (T1087.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: dcsync-rights-check-001
+    title: DCSync Rights Enumeration — dacledit Read on Domain Object
+    technique: T1087.002
+    severity: medium
+    description: >
+      Attacker enumerates which accounts have DS-Replication rights on domain
+      object to identify existing DCSync-capable accounts or verify own rights.
+    detection:
+      sigma_condition: |
+        EventID=4662 AND
+        Properties CONTAINS ANY ["1131f6aa", "1131f6ad"] AND
+        OperationType="Object Access" AND
+        SubjectUserName NOT IN dc_accounts
+    tools_used:
+      - "impacket-dacledit -action read -target-dn '{base_dn}' {dom}/{user}:{pass} -dc-ip {dc} | grep -iE 'replication|dcsync|DS-Replication'"
+      - "Get-DomainObjectAcl -Identity '{base_dn}' -ResolveGUIDs | Where-Object { $_.ObjectAceType -match 'DS-Replication'}"
+    remediation:
+      - Enumerate current replication rights regularly
+      - Remove unauthorized DS-Replication ACEs immediately
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/dcsync_dcshadow.py
+  rules:
+    - id: sast-code-dcsync-001
+      title: Full Dump Output File in World-Readable /tmp
+      severity: high
+      pattern: |
+        -outputfile\s+\/tmp\/dcsync_all
+      description: >
+        DCSync output (all domain NTLM hashes) written to /tmp/dcsync_all.ntds
+        — world-readable by any local user. This file contains ALL domain hashes.
+      recommendation: "Write to $HOME/.adrt_secure/ with chmod 600, or use in-memory only and print to stdout"
+
+    - id: sast-code-dcsync-002
+      title: grep Filter May Miss Variants of Trust Keyword
+      severity: low
+      pattern: |
+        grep -i trust
+      description: >
+        Grepping for 'trust' to filter trust accounts from secretsdump output
+        may miss accounts named differently. Consider more specific filter
+        for domain trust account patterns ($XXXX accounts).

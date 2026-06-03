@@ -1,0 +1,367 @@
+title: AdStrike Tool — Global SAST Analysis
+id: sast-tool-global-001
+status: production
+description: |
+  Global static analysis of the AdStrike tool codebase covering:
+  - Security vulnerabilities in the tool's own code (injection, credential handling)
+  - Operational security (OPSEC) issues in generated commands
+  - Tool-level detection evasion coverage gaps
+  - Dependency and configuration security
+author: AdStrike SAST Module
+date: 2026-04-24
+scope:
+  files:
+    - main.py
+    - utils/helpers.py
+    - config/settings.py
+    - modules/*.py
+  excluded:
+    - adrt_venv/**
+    - __pycache__/**
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEVERITY DEFINITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+severity_levels:
+  critical: "Attacker can compromise the operator's machine via tool use"
+  high: "Credentials exposed or serious OPSEC failures"
+  medium: "Operational mistakes or partial exposure"
+  low: "Minor issues or informational observations"
+  info: "Observations and best practices"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL SAST FINDINGS
+# ─────────────────────────────────────────────────────────────────────────────
+global_findings:
+
+# ─── CRITICAL FINDINGS ───────────────────────────────────────────────────────
+
+  - id: GLOBAL-CRIT-001
+    severity: critical
+    title: Subprocess Shell=True via run_cmd — Command Injection Risk
+    files: ["utils/helpers.py"]
+    description: >
+      The run_cmd() helper likely uses subprocess.run(cmd, shell=True) or os.system().
+      If any user-supplied value (username, password, domain, hostname) contains shell
+      metacharacters (;, &, |, $(), `), command injection is possible and would execute
+      on the operator's machine — not the target.
+    example_vulnerable: |
+      # User enters username: "admin; rm -rf ~"
+      run_cmd(f"impacket-psexec {dom}/admin; rm -rf ~:{pw}@{dc}")
+      # This deletes operator's home directory
+    remediation:
+      primary: "Use subprocess.run() with argument list (shell=False)"
+      secondary: "Apply shlex.quote() to ALL user-supplied values"
+      code_fix: |
+        import shlex, subprocess
+        def run_cmd(cmd: str):
+            # cmd must be pre-sanitized or split into list
+            proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
+            print(proc.stdout)
+            if proc.returncode != 0:
+                print(proc.stderr)
+
+  - id: GLOBAL-CRIT-002
+    severity: critical
+    title: Password Special Characters Break Command Construction
+    files: ["modules/*.py"]
+    description: >
+      Passwords containing single quotes ('), backticks (`), dollar signs ($),
+      or backslashes (\) break the shell command string when interpolated with
+      f"...'{pw}'...". This is both a functionality bug and security issue.
+      A password like "P@ss'word" would cause the command to fail or be
+      misinterpreted.
+    example_vulnerable: |
+      pw = "P@ss'word"
+      run_cmd(f"impacket-psexec domain/user:'{pw}'@dc")
+      # Result: impacket-psexec domain/user:'P@ss'word'@dc → shell parse error
+    remediation: |
+      Use shlex.quote() for all password values:
+      import shlex
+      pw_safe = shlex.quote(pw)
+      run_cmd(f"impacket-psexec {dom}/{user}:{pw_safe}@{dc}")
+
+# ─── HIGH FINDINGS ────────────────────────────────────────────────────────────
+
+  - id: GLOBAL-HIGH-001
+    severity: high
+    title: .env File Contains Plaintext Credentials — Committed to Filesystem
+    files: [".env"]
+    description: >
+      The .env file stores DC IP, domain, username, and password in plaintext.
+      If the AdStrike directory is shared, version controlled, or accessible
+      to other users, credentials are exposed. .gitignore may not cover all
+      scenarios.
+    check: |
+      cat /home/kali/Desktop/ADRedTeam/.env
+      # Check if real credentials are stored
+    remediation:
+      - Use OS keyring (python-keyring) for credential storage
+      - Encrypt .env with ansible-vault or similar
+      - Clear .env after each engagement
+      - Never commit .env to version control
+
+  - id: GLOBAL-HIGH-002
+    severity: high
+    title: Session State Stores Credentials in Memory Throughout Session
+    files: ["config/settings.py"]
+    description: >
+      SESSION dictionary caches credentials (domain, username, password, NTLM hash)
+      in memory for the entire tool session. If the tool crashes or produces
+      a core dump, credentials are exposed. Memory scanning tools could extract them.
+    remediation:
+      - Implement session timeout — clear cached credentials after N minutes
+      - Use SecureString equivalent for password in memory
+      - Avoid caching NTLM hashes in SESSION — request on demand
+
+  - id: GLOBAL-HIGH-003
+    severity: high
+    title: Output Files Written to /tmp with Predictable Names
+    files: ["modules/credential_dump.py", "modules/kerberos_attacks.py", "modules/dcsync_dcshadow.py"]
+    description: >
+      Many modules write sensitive output (NTLM hashes, Kerberos hashes, tickets)
+      to /tmp with predictable names (/tmp/ntds_hashes.ntds, /tmp/asrep.txt,
+      /tmp/dcsync_all.ntds). These files are:
+      1. World-readable by any local user
+      2. May persist across reboots on some systems
+      3. Named in a way that reveals pentesting activity
+    affected_patterns:
+      - "/tmp/asrep.txt"
+      - "/tmp/kerberoast.txt"
+      - "/tmp/ntds_hashes.ntds"
+      - "/tmp/dcsync_all.ntds"
+      - "/tmp/sam_dump.*"
+      - "/tmp/relay_out.txt"
+    remediation:
+      - Use mktemp -d to create unique temp directory with restricted permissions
+      - Write to $HOME/.adrt/output/ instead (user-private)
+      - Auto-cleanup sensitive files after session ends
+
+  - id: GLOBAL-HIGH-004
+    severity: high
+    title: NTLM Hashes and Kerberos Tickets Visible in Process List
+    files: ["modules/kerberos_attacks.py", "modules/lateral_movement.py"]
+    description: >
+      NTLM hashes and Kerberos ticket paths passed as command-line arguments
+      are visible in /proc/[pid]/cmdline on Linux. Any local user can read
+      the process command line and extract credentials.
+    affected_patterns:
+      - "impacket-psexec ... -hashes :{nth}"
+      - "evil-winrm ... -H {ntlm}"
+      - "export KRB5CCNAME={ccache}"
+    remediation:
+      - Pass hashes via environment variables (NTLM_HASH=...) + parse in tool
+      - Use credential files readable only by current user
+
+  - id: GLOBAL-HIGH-005
+    severity: high
+    title: No Input Validation on Target IP/Hostname
+    files: ["modules/*.py"]
+    description: >
+      All modules accept target DC IP/hostname from user input or session cache
+      without validation. Operators could accidentally target wrong IP (typo)
+      or session could have stale/wrong target from previous engagement.
+    remediation:
+      - Validate IP format with socket.inet_aton() or ipaddress.ip_address()
+      - Display target and require confirmation before executing destructive commands
+      - Implement target isolation (separate session per engagement)
+
+# ─── MEDIUM FINDINGS ──────────────────────────────────────────────────────────
+
+  - id: GLOBAL-MED-001
+    severity: medium
+    title: Tool Run as Root May Be Required for Some Functions
+    files: ["run.sh", "start-scan.sh"]
+    description: >
+      Some operations (Responder, network sniffing) require root privileges.
+      Running the entire tool as root unnecessarily escalates privileges.
+    remediation:
+      - Run tool as regular user
+      - Use sudo only for specific operations that require it
+      - Document which operations require root
+
+  - id: GLOBAL-MED-002
+    severity: medium
+    title: Python venv Packages May Be Outdated
+    files: ["requirements.txt", "adrt_venv/"]
+    description: >
+      Python dependencies in adrt_venv may have known CVEs in impacket,
+      ldap3, or other libraries. Regular updates required.
+    check: "pip list --outdated"
+    remediation:
+      - Pin dependency versions in requirements.txt
+      - Run pip-audit to check for known vulnerabilities
+      - Update impacket regularly (active security research updates)
+
+  - id: GLOBAL-MED-003
+    severity: medium
+    title: No Rate Limiting Guard for Destructive Operations
+    files: ["modules/password_attacks.py", "modules/dcsync_dcshadow.py"]
+    description: >
+      Password spraying with incorrect jitter or DCSync without authorization
+      check could cause account lockouts or trigger enterprise-wide security
+      alerts. No operator confirmation required before high-impact operations.
+    remediation:
+      - Add confirmation prompts for operations with high blast radius
+      - Implement lockout policy detection before spraying
+      - Log all destructive commands with timestamps to output/session.log
+
+  - id: GLOBAL-MED-004
+    severity: medium
+    title: Session Output Log May Contain Cleartext Credentials
+    files: ["output/session_*.log"]
+    description: >
+      Session log file at output/session_*.log may contain command output
+      including NTLM hashes, Kerberos tickets, and potentially cleartext
+      passwords printed by tools.
+    check: |
+      grep -i "password\|ntlm\|hash\|krbtgt" /home/kali/Desktop/ADRedTeam/output/*.log
+    remediation:
+      - Restrict log file permissions to 600
+      - Implement log sanitization (redact hash values)
+      - Consider encrypting log files with operator's key
+
+  - id: GLOBAL-MED-005
+    severity: medium
+    title: Tool Identification via Predictable Output File Names and Comments
+    files: ["modules/*.py"]
+    description: >
+      Output files like /tmp/kerberoast.txt, /tmp/asrep.txt, and tool-specific
+      messages (print_banner output) leave clear operational traces. Defenders
+      monitoring the target could identify specific tool based on output file names.
+    remediation:
+      - Use randomly generated output file names
+      - Suppress banner output in non-interactive mode
+      - Allow custom output paths via configuration
+
+# ─── LOW FINDINGS ─────────────────────────────────────────────────────────────
+
+  - id: GLOBAL-LOW-001
+    severity: low
+    title: No Engagement Metadata Validation
+    files: ["config/settings.py", ".env"]
+    description: >
+      Tool does not validate that engagement metadata (target IP, domain) matches
+      signed scope document. Operators could accidentally test out-of-scope systems.
+    remediation:
+      - Add scope file validation (IP range check against authorized targets)
+      - Require engagement ID/SOW reference at session start
+
+  - id: GLOBAL-LOW-002
+    severity: low
+    title: Tool Version and Module Info Not Displayed
+    files: ["main.py"]
+    description: >
+      Tool does not display version information at startup. Makes it harder to
+      track which version was used during engagement for report reproducibility.
+    remediation:
+      - Add __version__ to tool and display at startup
+      - Log tool version and module used in session log
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPSEC ANALYSIS — TOOL-GENERATED COMMAND PATTERNS
+# ─────────────────────────────────────────────────────────────────────────────
+opsec_analysis:
+  description: >
+    Analysis of OPSEC characteristics of commands generated by the tool.
+    High OPSEC = harder to detect by defenders.
+
+  findings:
+    - module: kerberos_attacks
+      technique: AS-REP Roasting
+      opsec_rating: medium
+      detection_risk: >
+        impacket-GetNPUsers generates LDAP queries and AS-REQ packets that
+        are distinguishable from legitimate traffic. Use during business hours
+        to blend in. RC4 encryption requests are notable.
+      improvement: "Use Rubeus with /enctype:aes to request AES tickets (less notable)"
+
+    - module: lateral_movement
+      technique: PSExec
+      opsec_rating: low
+      detection_risk: >
+        PSExec creates named pipe PSEXESVC, drops binary to ADMIN$, creates
+        Windows service. Heavily signatured by all EDR products.
+      improvement: "Use WMIExec or WinRS for lower detection profile"
+
+    - module: lateral_movement
+      technique: WinRS
+      opsec_rating: high
+      detection_risk: >
+        WinRS uses WinRM (same as Evil-WinRM) but spawns winrshost.exe instead
+        of PowerShell. Lower EDR signature than Evil-WinRM or PSExec.
+      improvement: "Combine with AMSI bypass inside WinRS shell for maximum stealth"
+
+    - module: credential_dump
+      technique: Invoke-Mimi
+      opsec_rating: medium
+      detection_risk: >
+        PowerShell Script Block Logging will capture Invoke-Mimi commands.
+        AMSI may detect Mimikatz command strings. Bypass AMSI first.
+      improvement: "Apply AMSI bypass before loading Invoke-Mimi"
+
+    - module: edr_evasion
+      technique: SafetyKatz via Loader.exe
+      opsec_rating: high
+      detection_risk: >
+        No file written to disk for Mimikatz. Loader.exe fetches from localhost
+        (port forwarded from attacker). Bypasses file-based AV.
+      improvement: "Use from memory (in-process .NET loading) instead of Loader.exe binary"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPENDENCY SECURITY
+# ─────────────────────────────────────────────────────────────────────────────
+dependency_analysis:
+  requirements_file: "requirements.txt"
+  critical_dependencies:
+    - name: impacket
+      version_check: "impacket>=0.11.0"
+      known_issues:
+        - "CVE-2021-43799: NTLMv1 downgrade in older versions"
+      recommendation: "Keep impacket updated — frequent security patches"
+
+    - name: ldap3
+      version_check: "ldap3>=2.9"
+      notes: "Used for LDAP queries — validate TLS certificate on production"
+
+    - name: bloodhound
+      notes: "bloodhound-python — ensure latest version for complete collection"
+
+  check_command: "pip-audit -r requirements.txt"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DETECTION COVERAGE SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+detection_coverage:
+  description: >
+    Summary of which attacks from AdStrike modules have SAST detection rules.
+
+  covered:
+    - kerberos_attacks: [AS-REP Roast, Kerberoast, PtT, Golden/Silver/Diamond Ticket, Delegation, RBCD]
+    - credential_dump: [LSASS, SAM, NTDS DCSync, LSA, LAPS, Vault, Invoke-Mimi, sekurlsa::ekeys]
+    - lateral_movement: [PSExec, WMIExec, SMBExec, Evil-WinRM, DCOM, PtH, WinRS, AtExec, RDP]
+    - acl_abuse: [DCSync Grant, Group AddMember, ForceChangePassword, Shadow Credentials, MAQ, BloodHound]
+    - cert_abuse: [ESC1-ESC13, PKINIT, UnPAC, Shadow Credentials via Cert, Enumeration]
+    - persistence: [AdminSDHolder, DSRM, Skeleton Key, Custom SSP, SID History, WMI, RunKey, NW Provider]
+    - coercion_attacks: [PrinterBug, PetitPotam, DFSCoerce, ShadowCoerce, Responder, Relay LDAP/ADCS]
+    - trust_attacks: [Cross-Forest Kerberoast, ExtraSID, Trust Keys, PAM Trust, SID History]
+    - password_attacks: [Spraying, Kerbrute, NTLM Relay, Credential Stuffing, Default Creds]
+    - gpo_abuse: [GPO Create/Link, RunKey, Scheduled Task, Restricted Groups, GPP Passwords]
+    - edr_evasion: [Defender Disable, SafetyKatz, AMSI, ETW, NTDLL Unhook, nanodump, Log Clear]
+    - dcsync_dcshadow: [DCSync All, DCSync Targeted, DCShadow, Rights Check]
+    - rbcd_attacks: [Full Chain MAQ, NTLM Relay RBCD, Bronze Bit, S4U2Self, Powermad]
+
+  not_yet_covered:
+    - amsi_bypass: "Separate module — partial coverage in edr_evasion.yml"
+    - azure_ad: "Entra ID / Azure attacks — different detection plane"
+    - entra_hybrid_attacks: "Hybrid identity attacks"
+    - c2_integration: "C2 framework-specific detections"
+    - cve_exploits: "CVE-specific rules vary by vulnerability"
+    - dpapi_creds: "DPAPI credential extraction"
+    - shadow_copies: "VSS shadow copy attacks"
+    - rodc_attacks: "RODC-specific techniques"
+    - mssql_abuse: "SQL Server attacks"
+    - sccm_abuse: "SCCM/ConfigMgr attacks"
+    - uac_bypass: "UAC bypass techniques"
+    - local_privesc: "Local privilege escalation"
+    - exploit_chains: "Chained exploits"

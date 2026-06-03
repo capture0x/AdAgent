@@ -1,0 +1,237 @@
+title: AdStrike - Trust Attacks Detection Rules
+id: sast-trust-001
+status: production
+description: |
+  SAST detection rules for Active Directory trust attack techniques including
+  cross-forest Kerberoasting, ExtraSID inter-realm ticket forgery, SID history
+  injection for trust escalation, PAM trust abuse, foreign group membership
+  enumeration, trust key extraction, and multi-hop forest traversal.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1558.001  # Golden Ticket (inter-realm)
+  - T1087.002  # Domain Account Enumeration
+  - T1134.005  # SID-History Injection
+  - T1484.002  # Domain Trust Modification
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Cross-Forest Kerberoasting  (T1558.003)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: trust-cross-forest-kerberoast-001
+    title: Cross-Forest Kerberoasting — Foreign Domain SPN Enumeration
+    technique: T1558.003
+    severity: high
+    description: >
+      Kerberoasting targeting service accounts in foreign trusted domains.
+      Requires authentication in source domain, requests TGS for foreign
+      domain SPNs using inter-realm ticket referral chain.
+    detection:
+      sigma_condition: |
+        EventID=4769 AND
+        TicketEncryptionType="0x17" AND
+        ClientAddress NOT IN [dom_dc_list] AND
+        ServiceName CONTAINS "@" AND
+        ServiceRealm != ClientRealm  # Cross-realm TGS request
+    tools_used:
+      - "impacket-GetUserSPNs -target-domain {trusted} {dom}/{user}:{pass} -dc-ip {dc} -request -outputfile cross_spns.txt"
+    remediation:
+      - Enable SID Filtering on all forest trusts
+      - Restrict service accounts in trusted domains to strong passwords/gMSA
+      - Monitor cross-realm TGS requests with RC4 encryption
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: ExtraSID — Inter-Realm Golden Ticket  (T1558.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: trust-extrasid-001
+    title: ExtraSID Attack — Inter-Realm Golden Ticket with Parent Domain SID
+    technique: T1558.001
+    severity: critical
+    description: >
+      ExtraSID injects parent/target domain's Enterprise Admin SID (S-1-5-21-*-519)
+      into the inter-realm TGT. When used against parent domain, grants EA-level
+      access without legitimate credentials in that domain.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4769, 4768]
+    detection:
+      sigma_condition: |
+        EventID=4769 AND
+        TicketEncryptionType="0x17" AND
+        ExtraFields CONTAINS "SIDHistory" AND
+        SIDHistoryValue CONTAINS "-519"  # Enterprise Admins SID
+      kerberos_pac_analysis:
+        - Ticket PAC contains SIDs from different domain than issuing DC
+        - SIDHistory in PAC contains -512 (DA) or -519 (EA) RIDs from external domain
+        - Ticket forged with child domain krbtgt but includes parent domain SIDs
+    tools_used:
+      - "impacket-ticketer -nthash {krbtgt_h} -domain-sid {dom_sid} -domain {dom} -extra-sid {target_sid}-519 -user-id 500 Administrator"
+      - "export KRB5CCNAME=Administrator.ccache"
+      - "impacket-psexec {parent_dom}/Administrator@{parent_dc} -k -no-pass"
+    false_positives:
+      - Legitimate cross-forest migration with SID History enabled
+    remediation:
+      - Enable SID Filtering on ALL trust relationships (breaks SID History migration — plan accordingly)
+      - Monitor inter-realm ticket requests with anomalous PAC content
+      - Deploy Microsoft Defender for Identity golden/inter-realm ticket detection
+      - Reset child domain krbtgt password twice if compromise suspected
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Trust Key Extraction  (T1003.003 variant)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: trust-key-extraction-001
+    title: Trust Key Extraction — lsadump::trust for Cross-Forest Silver Ticket
+    technique: T1003.003
+    severity: critical
+    description: >
+      Trust keys (Inter-Realm trust account hash) are stored in LSASS on DCs.
+      Extraction via lsadump::trust or secretsdump enables forging of
+      inter-realm tickets for cross-forest access.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4662, 4624]
+    detection:
+      sigma_condition: |
+        (EventID=4104 AND ScriptBlockText CONTAINS "lsadump::trust") OR
+        (impacket-secretsdump command CONTAINS "-just-dc-ntlm" AND target=dc AND
+         output CONTAINS "trust_account") OR
+        (EventID=4662 AND Properties CONTAINS trusted_domain_object_ACE)
+    tools_used:
+      - "impacket-secretsdump {dom}/{user}:{pass}@{dc} -just-dc-ntlm | grep -i trust"
+      - "mimikatz lsadump::trust /patch"
+      - "Invoke-Mimi -Command '\"lsadump::trust /patch\"'"
+    remediation:
+      - Reset trust account passwords (netdom resetpwd)
+      - Monitor trust account hash access on DCs
+      - Enable auditing on trust-related LDAP attributes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: PAM Trust Abuse — Bastion Forest  (T1484.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: trust-pam-001
+    title: PAM Trust Abuse — Shadow Principals in Privileged Access Management
+    technique: T1484.002
+    severity: critical
+    description: >
+      PAM (Privileged Access Management) trust allows bastion forest security
+      groups to have time-limited shadow memberships in production forest groups.
+      Abuse: attacker compromises bastion forest and abuses shadow principal mappings.
+    detection:
+      indicators:
+        - Unexpected trust of type "PAM" (msDS-TrustForest attribute)
+        - Shadow principals added to sensitive production groups via bastion
+        - Authentication from bastion forest accounts to production sensitive resources
+      sigma_condition: |
+        EventID=4728 AND TargetUserName IN privileged_groups AND
+        SubjectDomainName == bastion_forest_domain
+    remediation:
+      - Treat bastion forest with same security as production forest
+      - Review shadow principal mappings regularly
+      - Monitor cross-forest auth events from bastion accounts
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Trust Enumeration  (T1087.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: trust-enumeration-001
+    title: Domain Trust Enumeration via LDAP
+    technique: T1087.002
+    severity: medium
+    description: >
+      Detects LDAP enumeration of domain trust relationships via trustedDomain
+      object class queries. Provides attack map of connected forests.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4662]
+          conditions:
+            - field: ObjectType
+              value: "trustedDomain"
+    detection:
+      sigma_condition: |
+        EventID=4662 AND ObjectType="trustedDomain" AND
+        SubjectUserName NOT IN dc_computer_accounts AND
+        count() by SubjectUserName > 10 within 60s
+    tools_used:
+      - "ldapsearch -b '{base_dn}' '(objectClass=trustedDomain)' trustDirection trustPartner"
+      - "nltest /domain_trusts"
+      - "Get-DomainTrust"
+      - "impacket-findDelegation {dom}/{user}:{pass}"
+    remediation:
+      - Monitor bulk LDAP reads on trustedDomain objects
+      - Implement AD canary objects in trust enumeration paths
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Foreign Group Membership  (T1087.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: trust-foreign-group-001
+    title: Foreign Security Principal — Cross-Domain Group Membership Enumeration
+    technique: T1087.002
+    severity: medium
+    description: >
+      Foreign Security Principals (FSPs) represent accounts from trusted domains
+      that are members of local groups. Enumeration identifies potential
+      escalation paths via group membership in target domain.
+    detection:
+      sigma_condition: |
+        EventID=4662 AND
+        ObjectClass="foreignSecurityPrincipal" AND
+        count() by SubjectUserName > 20 within 60s
+    tools_used:
+      - "Get-DomainForeignGroupMember"
+      - "ldapsearch -b '{target_dn}' '(member=*)' cn member"
+      - "Get-DomainForeignUser"
+    remediation:
+      - Audit foreign security principals in sensitive groups
+      - Remove unnecessary cross-domain group memberships
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Child→Parent Escalation via SID History  (T1134.005)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: trust-child-parent-001
+    title: Child-to-Parent Domain Escalation via SID History Injection
+    technique: T1134.005
+    severity: critical
+    description: >
+      Compromising child domain krbtgt allows forging inter-realm TGT with
+      parent domain Enterprise Admin SID injected via SID history mechanism.
+      Effectively grants EA in parent domain from child domain compromise.
+    detection:
+      sigma_condition: |
+        EventID=4768 AND
+        CertificateIssuerName IS EMPTY AND
+        TicketEncryptionType="0x12" AND
+        SIDHistory CONTAINS parentDomainSID+"-519"  # EA SID from parent
+      behavioral:
+        - Child domain account accessing parent domain resources with EA privileges
+        - Cross-domain Kerberos ticket with extra SIDs
+    tools_used:
+      - "# Requires child domain krbtgt hash and domain SIDs"
+      - "impacket-ticketer -nthash {child_krbtgt} -domain-sid {child_sid} -domain {child_dom} -extra-sid {parent_sid}-519 Administrator"
+    remediation:
+      - Enable SID Filtering between parent and child domains
+      - Alert when -519 (EA) SID appears in tickets from child domain users
+      - Treat child domain compromise as parent domain compromise
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/trust_attacks.py
+  rules:
+    - id: sast-code-trust-001
+      title: Multiple Target Domain Variables — Naming Confusion Risk
+      severity: medium
+      pattern: |
+        trusted\s+=\s+prompt\("Foreign/Trusted domain"\)
+      description: >
+        "trusted" variable name may be confused with trust relationship type.
+        Consider using "foreign_domain" or "target_domain" for clarity.
+
+    - id: sast-code-trust-002
+      title: Parent DC IP Not Validated Against Known Hosts
+      severity: medium
+      pattern: |
+        parent_dc\s+=\s+prompt\("Parent DC IP"\)
+      description: >
+        Parent DC IP taken from user input without validation.
+        In forest traversal attacks, targeting wrong DC may cause
+        authentication to legitimate production system unintentionally.

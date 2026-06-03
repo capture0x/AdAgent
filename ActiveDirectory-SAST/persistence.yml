@@ -1,0 +1,348 @@
+title: AdStrike - Persistence Detection Rules
+id: sast-persist-001
+status: production
+description: |
+  SAST detection rules for domain and local persistence techniques including
+  Golden Ticket, AdminSDHolder, DSRM Backdoor, Skeleton Key, Custom SSP,
+  SID History, ACL backdoors, Scheduled Tasks, Registry Run Keys,
+  WMI Event Subscriptions, and Custom Network Providers.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1558.001  # Golden Ticket
+  - T1098      # Account Manipulation
+  - T1078.002  # Domain Accounts
+  - T1547.001  # Registry Run Keys
+  - T1053.005  # Scheduled Task
+  - T1546.003  # WMI Event Subscription
+  - T1547.014  # Active Setup
+  - T1556.001  # Domain Controller Authentication (Skeleton Key)
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: AdminSDHolder Backdoor  (T1098)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: persist-adminsdholder-001
+    title: AdminSDHolder ACL Modification — Persistent Privileged Access
+    technique: T1098
+    severity: critical
+    description: >
+      AdminSDHolder is a template object whose DACL is propagated to all
+      protected groups every 60 minutes by SDPropagator. Adding a backdoor
+      ACE to AdminSDHolder grants persistent access that survives direct
+      group membership removal.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [5136]
+          conditions:
+            - field: ObjectDN
+              contains: "CN=AdminSDHolder,CN=System"
+    detection:
+      sigma_condition: |
+        EventID=5136 AND
+        ObjectDN CONTAINS "CN=AdminSDHolder,CN=System" AND
+        OperationType="Value Added" AND
+        SubjectUserName NOT IN ["Enterprise Admins", "Domain Admins", "SYSTEM"]
+      critical_indicators:
+        - Any modification to AdminSDHolder nTSecurityDescriptor by non-EA account
+        - SDPropagator running outside scheduled interval (manual trigger = Invoke-SDPropagator)
+    tools_used:
+      - "Set-DomainObjectAcl -TargetIdentity 'AdminSDHolder' -PrincipalIdentity {user} -Rights All"
+      - "Add-DomainObjectAcl -TargetIdentity 'CN=AdminSDHolder,CN=System,...' -PrincipalIdentity {user} -Rights DCSync"
+    remediation:
+      - Monitor Event 5136 on AdminSDHolder object
+      - Review AdminSDHolder DACL quarterly
+      - Alert on manual SDPropagator execution (Invoke-SDPropagator command)
+      - "Get-Acl 'AD:CN=AdminSDHolder,CN=System,DC=corp,DC=local' | fl"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: DSRM Backdoor  (T1078.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: persist-dsrm-001
+    title: DSRM Account Backdoor — Remote DC Login via Directory Services Restore Mode
+    technique: T1078.002
+    severity: critical
+    description: >
+      DSRM (Directory Services Restore Mode) account is a local administrator
+      on every DC. By setting DSRMAdminLogonBehavior=2, DSRM account can be
+      used for remote network authentication — persistent DC backdoor.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4657]
+          conditions:
+            - field: ObjectName
+              contains: "DSRMAdminLogonBehavior"
+    registry_indicators:
+      - key: "HKLM\\System\\CurrentControlSet\\Control\\Lsa\\DSRMAdminLogonBehavior"
+        value: "2"
+    detection:
+      sigma_condition: |
+        (EventID=4657 AND ObjectName CONTAINS "DSRMAdminLogonBehavior" AND
+         NewValue="2") OR
+        (EventID=4624 AND LogonType=3 AND
+         SubjectDomainName NOT IN [dom] AND
+         TargetUserName="Administrator" AND
+         TargetDomainName IN dc_hostname_list)
+    tools_used:
+      - "New-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Lsa\\' -Name 'DSRMAdminLogonBehavior' -Value 2"
+      - "Set-DomainAccountPassword -Identity 'Administrator' -AccountPassword (ConvertTo-SecureString '{pass}' -AsPlainText -Force) -domain {dc_hostname}"
+    remediation:
+      - Remove or reset DSRMAdminLogonBehavior to 0
+      - Regularly rotate DSRM password (at least annually)
+      - Monitor registry key DSRMAdminLogonBehavior for value changes
+      - Alert on logon type 3 using DSRM-like local admin accounts on DCs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Skeleton Key (T1556.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: persist-skeleton-key-001
+    title: Skeleton Key — Mimikatz LSASS Patch for Master Password
+    technique: T1556.001
+    severity: critical
+    description: >
+      Skeleton Key patches LSASS on the DC to accept any password ("skeleton key")
+      for any domain account in addition to the real password. Non-persistent —
+      cleared on DC reboot. Requires DA privileges.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4611, 4657]
+      - sysmon_eventlog:
+          event_ids: [10]
+          conditions:
+            - field: TargetImage
+              endswith: "\\lsass.exe"
+            - field: SourceImage
+              contains_any: ["mimikatz", "invoke-mimi"]
+    detection:
+      sigma_condition: |
+        (EventID=10 AND TargetImage ENDSWITH "\\lsass.exe" AND
+         GrantedAccess IN ["0x1438","0x143a","0x1fffff"]) OR
+        (EventID=4104 AND ScriptBlockText CONTAINS "misc::skeleton") OR
+        (ProcessName="mimikatz.exe" AND CommandLine CONTAINS "misc::skeleton")
+    tools_used:
+      - "mimikatz misc::skeleton"
+      - "Invoke-Mimi -Command '\"misc::skeleton\"'"
+    remediation:
+      - Deploy Credential Guard (prevents LSASS patching)
+      - Monitor Event ID 4611 (Trusted Logon Process) on DCs
+      - Alert on LSASS memory writes from non-system processes on DCs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Custom SSP — mimilib  (T1547.005)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: persist-custom-ssp-001
+    title: Custom SSP Installation — mimilib Credential Logger
+    technique: T1547.005
+    severity: critical
+    description: >
+      Installing mimilib.dll as Security Support Provider (SSP) causes Windows
+      to log all authentication credentials to C:\Windows\System32\kiwissp.log.
+      Survives reboots as DLL registered in LSA Security Packages registry key.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4657]
+          conditions:
+            - field: ObjectName
+              contains: "Security Packages"
+    registry_indicators:
+      - key: "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\Security Packages"
+        suspicious_values: ["mimilib"]
+    file_indicators:
+      - path: "C:\\Windows\\System32\\kiwissp.log"
+      - path: "C:\\Windows\\System32\\mimilib.dll"
+    detection:
+      sigma_condition: |
+        (EventID=4657 AND ObjectName CONTAINS "Security Packages" AND
+         NewValue CONTAINS "mimilib") OR
+        (EventID=4688 AND NewProcessName ENDSWITH "\\svchost.exe" AND
+         CommandLine CONTAINS "mimilib")
+    tools_used:
+      - "mimikatz misc::memssp  # In-memory SSP (no disk write)"
+      - "Add-MpPreference -ExclusionPath C:\\Windows\\System32"
+      - "reg add 'HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa' /v 'Security Packages' /d 'mimilib'"
+    remediation:
+      - Monitor registry key "Security Packages" for unauthorized DLL additions
+      - Monitor for kiwissp.log creation in System32
+      - Use Windows Defender ASR rule "Block credential stealing from LSASS"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: SID History Injection  (T1134.005)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: persist-sid-history-001
+    title: SID History Injection — Hidden Domain Admin Privileges
+    technique: T1134.005
+    severity: critical
+    description: >
+      SID History stores SIDs from previous domain migrations. Injecting DA SID
+      into regular user's SID History grants DA-level access without group
+      membership — bypasses membership-based monitoring.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4765, 4766]  # SID History added
+    detection:
+      sigma_condition: |
+        (EventID=4765 OR EventID=4766) AND
+        SubjectUserName NOT IN migration_service_accounts AND
+        NOT in_progress_migration
+      ldap_detection:
+        - LDAP write to sIDHistory attribute (Event 5136)
+        - sIDHistory containing Domain Admin SID (S-1-5-21-*-512)
+    tools_used:
+      - "mimikatz lsadump::sid /sam:{user} /new:{SID}"
+      - "Set-DomainObject -Identity {user} -Set @{sIDHistory='{DA-SID}'}"
+    remediation:
+      - Enable SID filtering on all domain trusts
+      - Monitor Event 4765/4766 for unexpected SID History additions
+      - Audit users with sIDHistory set to privileged SIDs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: WMI Event Subscription Persistence  (T1546.003)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: persist-wmi-subscription-001
+    title: WMI Event Subscription — Fileless Persistence
+    technique: T1546.003
+    severity: high
+    description: >
+      WMI event subscriptions (EventFilter + EventConsumer + FilterToConsumerBinding)
+      provide fileless persistence triggered by system events. CommandLineEventConsumer
+      executes arbitrary commands. Very stealthy — no scheduled task or registry Run key.
+    event_sources:
+      - sysmon_eventlog:
+          event_ids: [19, 20, 21]  # WMI EventFilter, Consumer, Binding
+      - windows_security_eventlog:
+          event_ids: [5858, 5861]  # WMI activity
+    detection:
+      sigma_condition: |
+        EventID=21 AND
+        Consumer CONTAINS "CommandLineEventConsumer" AND
+        NOT (Consumer CONTAINS "Microsoft" OR Consumer CONTAINS "SCM Event")
+      process_indicators:
+        - WmiPrvSE.exe spawning non-expected processes
+        - Scrcons.exe (script event consumer) executing code
+    tools_used:
+      - "Register-WMIEvent -Query 'SELECT * FROM __InstanceModificationEvent...' -Action {Start-Process powershell.exe}"
+      - "New-WMISubscription -Name backdoor -Query '...' -Command 'powershell.exe'"
+    remediation:
+      - Enable Sysmon WMI subscription logging (Event IDs 19, 20, 21)
+      - Monitor WmiPrvSE.exe child processes
+      - Audit existing WMI subscriptions: Get-WmiObject -Namespace root/subscription -Class __EventFilter
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Registry Run Key  (T1547.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: persist-registry-runkey-001
+    title: Registry Run Key — Local Persistence
+    technique: T1547.001
+    severity: high
+    description: >
+      Adds executable to HKCU or HKLM Run registry keys for execution at
+      logon/startup. Classic local persistence mechanism.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4657]
+    registry_indicators:
+      - key: "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+      - key: "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run"
+      - key: "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
+      - key: "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
+    detection:
+      sigma_condition: |
+        EventID=4657 AND ObjectName CONTAINS "\\CurrentVersion\\Run" AND
+        OperationType="Existing Registry Value Modified" OR OperationType="New Registry Value Created" AND
+        SubjectUserName NOT IN software_deployment_accounts
+    tools_used:
+      - "New-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'Updater' -Value 'C:\\payload.exe'"
+      - "reg add 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' /v Updater /d C:\\payload.exe"
+    remediation:
+      - Monitor registry Run key modifications (Event 4657)
+      - Enable Autoruns monitoring and alerting
+      - Restrict HKLM Run key writes to SYSTEM/Administrators
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Custom Network Provider — NPPSPY  (T1556)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: persist-network-provider-001
+    title: Custom Network Provider — NPPSPY Credential Capture on Logon
+    technique: T1556
+    severity: critical
+    description: >
+      NPPSPY registers a malicious DLL as a Network Provider that receives
+      all plaintext credentials during Windows logon. Survives reboots.
+      Credentials written to C:\NPPSpy.txt or similar.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4657]
+          conditions:
+            - field: ObjectName
+              contains: "NetworkProvider\\Order"
+    registry_indicators:
+      - key: "HKLM\\SYSTEM\\CurrentControlSet\\Control\\NetworkProvider\\Order"
+      - key: "HKLM\\SYSTEM\\CurrentControlSet\\Services\\{NPPSpy}"
+    detection:
+      sigma_condition: |
+        EventID=4657 AND (
+          ObjectName CONTAINS "NetworkProvider\\Order" OR
+          ObjectName CONTAINS "\\Services\\NPP"
+        ) AND SubjectUserName NOT IN ["SYSTEM", "TrustedInstaller"]
+    tools_used:
+      - "Install-NetworkProvider -DllPath C:\\NPPSpy.dll"
+      - "reg add 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\NPPSpy' /v 'NetworkProvider' ..."
+    remediation:
+      - Monitor NetworkProvider registry key modifications
+      - Audit registered Network Providers on all systems
+      - Implement allowlisting for approved Network Provider DLLs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Constrained Delegation Backdoor  (T1098)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: persist-delegation-backdoor-001
+    title: Persistent Constrained Delegation — msDS-AllowedToDelegateTo Modification
+    technique: T1098
+    severity: critical
+    description: >
+      Attacker with GenericWrite/WriteDACL sets msDS-AllowedToDelegateTo
+      on a controlled account to allow impersonation to sensitive services.
+      Provides persistent impersonation path that survives password resets.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [5136]
+          conditions:
+            - field: AttributeLDAPDisplayName
+              value: "msDS-AllowedToDelegateTo"
+    detection:
+      sigma_condition: |
+        EventID=5136 AND
+        AttributeLDAPDisplayName="msDS-AllowedToDelegateTo" AND
+        OperationType="Value Added" AND
+        SubjectUserName NOT IN authorized_delegation_admins
+    remediation:
+      - Alert on any msDS-AllowedToDelegateTo modification (Event 5136)
+      - Audit delegation attributes quarterly
+      - Enable "Account is sensitive and cannot be delegated" for DA accounts
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/persistence.py
+  rules:
+    - id: sast-code-persist-001
+      title: Base64 Import Without Use Validation
+      severity: low
+      pattern: |
+        import base64
+      description: >
+        base64 imported in persistence module — verify it is used only for
+        legitimate payload encoding, not for obfuscating malicious commands
+        that would be sent to targets.
+
+    - id: sast-code-persist-002
+      title: Golden Ticket krbtgt Hash Stored in Session Variable
+      severity: high
+      pattern: |
+        krbtgt\s+=\s+prompt\("krbtgt NTLM hash"\)
+      description: >
+        krbtgt hash obtained from user input stored in local variable.
+        Ensure SESSION object does not persist krbtgt hash between runs
+        as it represents the most sensitive domain credential.
+      recommendation: "Explicitly clear krbtgt hash from SESSION after ticket generation"

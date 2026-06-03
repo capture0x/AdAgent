@@ -1,0 +1,315 @@
+title: AdStrike - ADCS Certificate Abuse Detection Rules (ESC1-ESC13)
+id: sast-cert-001
+status: production
+description: |
+  SAST detection rules for Active Directory Certificate Services (ADCS) attack
+  techniques including ESC1-ESC13. Covers template enumeration, certificate
+  enrollment abuse, CA misconfigurations, relay attacks, and credential
+  extraction via PKINIT/UnPAC-the-Hash.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1649  # Steal or Forge Authentication Certificates
+  - T1558  # Steal or Forge Kerberos Tickets
+  - T1552  # Unsecured Credentials
+  - T1557  # Adversary-in-the-Middle
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: ESC1 — SAN Abuse (T1649)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: cert-esc1-001
+    title: ESC1 — Certificate Enrollment with Arbitrary SAN (Domain Admin Impersonation)
+    technique: T1649
+    severity: critical
+    description: >
+      ESC1: Certificate template allows requestor to specify Subject Alternative Name
+      (SAN) with CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT. Attacker enrolls certificate
+      as Domain Admin by specifying admin UPN in SAN field.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4886, 4887]  # Certificate request / issued
+      - certsvc_eventlog:
+          event_ids: [4886, 4887]
+    detection:
+      sigma_condition: |
+        EventID=4887 AND
+        CertificateSubjectName CONTAINS "administrator" AND
+        RequestorName NOT IN [administrator_list] AND
+        SubjectAlternativeName CONTAINS "@" AND
+        NOT RequestorName ENDSWITH "$"  # Not a computer account
+      indicators:
+        - Certificate issued with SAN different from requestor identity
+        - Template name includes: User, Computer, DomainController
+        - RequestedAttributes contains "SAN:" field
+        - Certificate enrollment from non-domain-joined machine
+    certipy_detection:
+      command_patterns:
+        - "certipy req.*-upn.*administrator@"
+        - "certipy req.*-template.*-upn"
+    tools_used:
+      - "certipy req -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -template '{template}' -upn 'administrator@{dom}' -ca '{ca}'"
+      - "certipy auth -pfx admin.pfx -dc-ip {dc} -domain {dom}"
+    false_positives:
+      - PKI administrators legitimately issuing certificates with SAN
+    remediation:
+      - Remove CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT from template flags
+      - Require CA Manager Approval for sensitive templates
+      - Enable "Auditing" on all certificate templates
+      - Monitor Event 4887 for cross-identity certificate issuance
+    references:
+      - https://posts.specterops.io/certified-pre-owned-d95910965cd2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: ESC4 — Template ACL Overwrite  (T1649)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: cert-esc4-001
+    title: ESC4 — Certificate Template ACL Overwrite (WriteDACL/WriteOwner/GenericWrite)
+    technique: T1649
+    severity: critical
+    description: >
+      ESC4: Attacker has WriteDACL, WriteOwner, or GenericWrite over a certificate
+      template. Modifies template to grant ENROLLEE_SUPPLIES_SUBJECT, then requests
+      certificate as DA. Certipy template command with -save-old preserves original.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [5136]
+          conditions:
+            - field: ObjectClass
+              value: "pKICertificateTemplate"
+    detection:
+      sigma_condition: |
+        EventID=5136 AND
+        ObjectClass="pKICertificateTemplate" AND
+        AttributeLDAPDisplayName IN [
+          "msPKI-Certificate-Name-Flag",  # ESC1 flag: 1 = ENROLLEE_SUPPLIES_SUBJECT
+          "msPKI-Enrollment-Flag",
+          "nTSecurityDescriptor",
+          "pKIExtendedKeyUsage"
+        ] AND
+        SubjectUserName NOT IN PKI_admin_accounts
+    tools_used:
+      - "certipy template -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -template '{template}' -save-old"
+    remediation:
+      - Audit and alert on Event 5136 for pKICertificateTemplate object modifications
+      - Restrict template modification to PKI Admins and Enterprise Admins only
+      - Review template ACLs regularly with Certify or certipy find
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: ESC6 — CA Flag EDITF_ATTRIBUTESUBJECTALTNAME2  (T1649)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: cert-esc6-001
+    title: ESC6 — CA Flag Abuse (EDITF_ATTRIBUTESUBJECTALTNAME2)
+    technique: T1649
+    severity: critical
+    description: >
+      ESC6: CA has EDITF_ATTRIBUTESUBJECTALTNAME2 flag set, allowing SAN in any
+      request even if template doesn't have ENROLLEE_SUPPLIES_SUBJECT. Equivalent
+      impact to ESC1 but at CA level.
+    event_sources:
+      - certsvc_eventlog:
+          event_ids: [4886, 4887]
+    detection:
+      indicators:
+        - CA with EDITF_ATTRIBUTESUBJECTALTNAME2 flag (certutil -getreg policy\EditFlags)
+        - Certificate requests containing SAN data for non-requester UPNs
+      sigma_condition: |
+        EventID=4887 AND
+        Template="SubCA" AND
+        SubjectAlternativeName CONTAINS "@" AND
+        NOT (RequestorName == SubjectAlternativeNameUser)
+    tools_used:
+      - "certipy ca -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -enable-template 'SubCA'"
+      - "certipy req -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -template SubCA -upn 'administrator@{dom}' -ca '{ca}'"
+    remediation:
+      - Remove EDITF_ATTRIBUTESUBJECTALTNAME2 flag from CA
+      - "certutil -setreg policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2"
+      - Restart CertSvc after change
+      - Audit CA configuration with certipy find -vulnerable
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: ESC8 — NTLM Relay to ADCS HTTP Enrollment  (T1557 + T1649)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: cert-esc8-001
+    title: ESC8 — NTLM Relay to ADCS Web Enrollment for DC Certificate
+    technique: T1557
+    severity: critical
+    description: >
+      ESC8: ADCS web enrollment endpoint (certsrv) accepts NTLM authentication.
+      Attacker relays DC NTLM authentication (via PrinterBug/PetitPotam) to
+      ADCS, obtains DC certificate, then uses PKINIT to get DC TGT → DCSync.
+    event_sources:
+      - iis_accesslog:
+          path: "%SystemRoot%\\System32\\LogFiles\\W3SVC*"
+          indicators:
+            - "POST /certsrv/certfnsh.asp"
+            - "Authorization: NTLM"
+      - windows_security_eventlog:
+          event_ids: [4886, 4887]
+          conditions:
+            - field: Template
+              value: "DomainController"
+            - field: RequestorName
+              not_endswith: "$"  # Computer account should request DC cert
+    detection:
+      sigma_condition: |
+        EventID=4887 AND
+        Template IN ["DomainController", "DomainControllerAuthentication", "KerberosAuthentication"] AND
+        SubjectName CONTAINS "CN=DC" AND
+        NOT RequestorMachine IN dc_list
+    network_indicators:
+      - destination_port: 80
+        uri_contains: "/certsrv/certfnsh.asp"
+        method: POST
+        auth: NTLM
+    tools_used:
+      - "impacket-ntlmrelayx -t http://{dc}/certsrv/certfnsh.asp -smb2support --adcs --template DomainController"
+      - "certipy relay -ca {dc} -template DomainController"
+    remediation:
+      - Enable HTTPS on ADCS web enrollment (disable HTTP)
+      - Enable EPA (Extended Protection for Authentication) on IIS
+      - Require Kerberos authentication for ADCS web enrollment
+      - Monitor ADCS Event 4886/4887 for cross-machine DC cert enrollment
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: ESC9 — CT_FLAG_NO_SECURITY_EXTENSION  (T1649)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: cert-esc9-001
+    title: ESC9 — No Security Extension (SID Binding Bypass)
+    technique: T1649
+    severity: high
+    description: >
+      ESC9: Template has CT_FLAG_NO_SECURITY_EXTENSION (0x80000) in
+      msPKI-Enrollment-Flag. Issued cert lacks szOID_NTDS_CA_SECURITY_EXT
+      SID binding, allowing cert to be used for auth as different account
+      if GenericWrite exists on target.
+    event_sources:
+      - certsvc_eventlog:
+          event_ids: [4887]
+    detection:
+      indicators:
+        - Template with msPKI-Enrollment-Flag containing 0x80000
+        - Certificate issued without SID extension (OID 1.3.6.1.4.1.311.25.2)
+      sigma_condition: |
+        EventID=4887 AND
+        IssuedCertificate NOT CONTAINS OID "1.3.6.1.4.1.311.25.2" AND
+        Template NOT IN ["Machine", "User"]  # Legacy templates exempt
+    remediation:
+      - Require CA to mark certificates with szOID_NTDS_CA_SECURITY_EXT
+      - Apply May 2022 cumulative update (KB5014754) — StrongCertificateBindingEnforcement
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: ESC11 — RPC Certificate Enrollment Relay  (T1557 + T1649)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: cert-esc11-001
+    title: ESC11 — RPC Relay to Certificate Enrollment (IF_ENFORCEENCRYPTICERTREQUEST)
+    technique: T1557
+    severity: high
+    description: >
+      ESC11: CA does not have IF_ENFORCEENCRYPTICERTREQUEST flag, enabling
+      NTLM relay to RPC-based certificate enrollment (MS-ICPR) without
+      encryption. Attacker relays SMB/HTTP auth to obtain arbitrary certificate.
+    detection:
+      indicators:
+        - CA missing IF_ENFORCEENCRYPTICERTREQUEST flag in configuration
+        - NTLM relay to RPC port 49152+ with ICertPassage interface
+    remediation:
+      - Set IF_ENFORCEENCRYPTICERTREQUEST flag on CA
+      - Enable DCOM authentication level >= Packet Privacy
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: PKINIT / UnPAC-the-Hash  (T1558)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: cert-pkinit-001
+    title: PKINIT Authentication — Certificate Used for Kerberos TGT
+    technique: T1558
+    severity: high
+    description: >
+      Detects use of certificate for Kerberos pre-authentication (PKINIT).
+      Used post-ESC1/ESC6/Shadow Credentials to get TGT. UnPAC-the-Hash
+      extracts NTLM hash from the TGT without touching LSASS.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4768]
+          conditions:
+            - field: CertIssuerName
+              is_not_empty: true
+            - field: CertSerialNumber
+              is_not_empty: true
+    detection:
+      sigma_condition: |
+        EventID=4768 AND
+        CertIssuerName IS NOT EMPTY AND
+        ClientAddress NOT IN DC_list AND
+        TargetUserName IN privileged_accounts_list
+    tools_used:
+      - "certipy auth -pfx '{pfx}' -dc-ip {dc} -domain {dom}"
+      - "certipy auth -pfx '{pfx}' -dc-ip {dc} -domain {dom} -no-hash  # UnPAC-the-Hash"
+      - "Rubeus.exe asktgt /user:{user} /certificate:{base64_pfx} /ptt"
+    remediation:
+      - Monitor Event 4768 with certificate fields populated
+      - Alert on PKINIT authentication for accounts not enrolled in Smart Card auth
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: certipy find — Vulnerable Template Enumeration  (T1087.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: cert-enum-001
+    title: ADCS Template Enumeration — Certipy find
+    technique: T1087.002
+    severity: medium
+    description: >
+      Detects ADCS template enumeration via certipy find or Certify.exe.
+      Generates LDAP queries against PKI container for template attributes.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4662]
+          conditions:
+            - field: ObjectType
+              value: "pKICertificateTemplate"
+    detection:
+      sigma_condition: |
+        EventID=4662 AND
+        ObjectType="pKICertificateTemplate" AND
+        count() by SubjectUserName > 50 within 30s AND
+        SubjectUserName NOT IN PKI_admin_accounts
+    tools_used:
+      - "certipy find -u '{user}@{dom}' -p '{pass}' -dc-ip {dc} -vulnerable -stdout"
+      - "Certify.exe find /vulnerable"
+    remediation:
+      - Monitor bulk pKICertificateTemplate LDAP reads
+      - Implement AD CS Canary templates that alert on enumeration
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/cert_abuse.py
+  rules:
+    - id: sast-code-cert-001
+      title: CA Name Left Blank — Possible Enumeration Skip
+      severity: low
+      pattern: |
+        ca\s+=\s+prompt\("CA Name.*blank = auto-detect"\)
+      description: >
+        If CA name not provided, certipy may use default CA. In environments
+        with multiple CAs, auto-detect may target wrong CA. Validate CA
+        name against discovered CA list.
+
+    - id: sast-code-cert-002
+      title: PFX File Path from Untrusted Input
+      severity: medium
+      pattern: |
+        pfx\s+=\s+prompt\("\.pfx file path"\)
+      description: >
+        PFX file path taken from user input without validation. Path traversal
+        or symlink attacks possible if path is used in file operations.
+      recommendation: "Validate path exists and is a regular file before use"
+
+    - id: sast-code-cert-003
+      title: NTLM Relay Command Exposes CA Target
+      severity: info
+      pattern: |
+        info\(f"Run: impacket-ntlmrelayx.*--adcs.*"\)
+      description: >
+        Relay command is displayed as info message only — not executed automatically.
+        This is correct OPSEC practice (operator confirms before running relay).

@@ -1,0 +1,261 @@
+title: AdStrike - GPO Abuse Detection Rules
+id: sast-gpo-001
+status: production
+description: |
+  SAST detection rules for Group Policy Object (GPO) abuse techniques including
+  GPO creation and linking, Registry RunKey via GPO, Scheduled Tasks,
+  Restricted Groups, Startup Scripts, GPO delegation enumeration,
+  and GPP (Group Policy Preferences) password extraction.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack:
+  - T1484.001  # Domain Policy Modification
+  - T1547.001  # Registry Run Keys / Startup Folder
+  - T1053.005  # Scheduled Task/Job
+  - T1552.006  # Group Policy Preferences
+
+rules:
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: GPO Creation and Linking  (T1484.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: gpo-create-link-001
+    title: Unauthorized GPO Creation and OU Linking
+    technique: T1484.001
+    severity: critical
+    description: >
+      Attacker with GPO creation rights creates malicious GPO and links it to
+      target OU. All computers/users in that OU execute GPO settings at next
+      Group Policy refresh (90 minutes or forced via gpupdate).
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [5136, 5137]  # AD object modified, created
+          conditions:
+            - field: ObjectClass
+              values: ["groupPolicyContainer", "organizationalUnit"]
+      - directory_service_eventlog:
+          event_ids: [5137]
+    detection:
+      sigma_condition: |
+        (EventID=5137 AND ObjectClass="groupPolicyContainer" AND
+         SubjectUserName NOT IN gpo_admin_accounts)
+        OR
+        (EventID=5136 AND AttributeLDAPDisplayName="gPLink" AND
+         OperationType="Value Added" AND
+         SubjectUserName NOT IN gpo_admin_accounts)
+    tools_used:
+      - "New-GPO -Name '{gpo_name}' | New-GPLink -Target '{target_ou}'"
+      - "SharpGPOAbuse.exe --AddComputerTask --TaskName {name} --Author {user} --Command cmd.exe --Arguments '/c {cmd}' --GPOName '{gpo}'"
+    remediation:
+      - Alert on Event 5137 for new GPO creation by non-admin accounts
+      - Alert on Event 5136 for gPLink modifications on sensitive OUs
+      - Restrict GPO creation rights in Group Policy Management
+      - Implement GPO change management workflow with approval
+      - Audit "Create GPO" permission assignments
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Registry RunKey via GPO  (T1547.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: gpo-runkey-001
+    title: GPO Registry RunKey — Code Execution on Startup via Group Policy
+    technique: T1547.001
+    severity: critical
+    description: >
+      Attacker abuses GPO to push registry RunKey to all computers in target OU.
+      Executes payload on every system restart or group policy refresh.
+      HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run via GPO is invisible
+      to standard registry monitoring of directly-written keys.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4657]
+    gpo_file_indicators:
+      - path: "SYSVOL\\{domain}\\Policies\\{GPO-GUID}\\Machine\\Preferences\\Registry"
+    detection:
+      sigma_condition: |
+        EventID=4657 AND
+        ObjectName CONTAINS "\\CurrentVersion\\Run" AND
+        SubjectUserName NOT IN software_deployment_accounts AND
+        RegistryWrittenVia="GroupPolicy"
+      file_indicators:
+        - "\\\\{dc}\\SYSVOL\\{dom}\\Policies\\*\\Machine\\Preferences\\Registry\\Registry.xml"
+        - New XML files in SYSVOL Policy folders
+    tools_used:
+      - "Set-GPPrefRegistryValue -Name '{gpo_name}' -Context Computer -Action Create -Key 'HKLM\\...\\Run' -ValueName '{name}' -Value '{cmd}'"
+    remediation:
+      - Monitor SYSVOL for new Registry.xml files in Policy folders
+      - Alert on RunKey additions via Group Policy
+      - Review GPO Registry Preference settings regularly
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Immediate Scheduled Task via GPO  (T1053.005)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: gpo-scheduled-task-001
+    title: GPO Immediate Scheduled Task — SharpGPOAbuse
+    technique: T1053.005
+    severity: critical
+    description: >
+      SharpGPOAbuse creates an "Immediate" scheduled task via GPO that executes
+      on next Group Policy refresh without waiting for reboot. Most immediate
+      GPO code execution technique.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4698]
+          conditions:
+            - field: TaskContent
+              contains: "RunAs=SYSTEM"
+    gpo_file_indicators:
+      - path: "SYSVOL\\*\\Policies\\*\\Machine\\Preferences\\ScheduledTasks"
+    detection:
+      sigma_condition: |
+        (EventID=4698 AND
+         TaskName CONTAINS ANY ["Immediate", attacker_task_names] AND
+         RegistrationInfo.Author NOT IN legitimate_task_authors) OR
+        (File.Path CONTAINS "SYSVOL" AND File.Path CONTAINS "ScheduledTasks" AND
+         File.Extension=".xml" AND File.Created IN last_24h)
+    tools_used:
+      - "SharpGPOAbuse.exe --AddComputerTask --TaskName {name} --Author {user} --Command cmd.exe --Arguments '/c {cmd}' --GPOName '{gpo}' --Force"
+    remediation:
+      - Monitor SYSVOL ScheduledTasks directories for new XML files
+      - Alert on Event 4698 with non-standard task authors
+      - Require change control for GPO scheduled task modifications
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: GPO Restricted Groups — Local Admin Addition  (T1098.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: gpo-restricted-groups-001
+    title: GPO Restricted Groups — Unauthorized Local Admin Addition
+    technique: T1098.001
+    severity: critical
+    description: >
+      GPO Restricted Groups policy forces group membership on managed computers.
+      Adding attacker account to Local Administrators via GPO grants local admin
+      on all computers in linked OUs automatically.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4732]  # Member added to local group
+          conditions:
+            - field: TargetUserName
+              value: "Administrators"
+      - sysmon_eventlog:
+          event_ids: [13]  # Registry value set
+          conditions:
+            - field: TargetObject
+              contains: "RestrictedGroups"
+    gpo_file_indicators:
+      - path: "SYSVOL\\*\\Policies\\*\\Machine\\Microsoft\\Windows NT\\SecEdit\\GptTmpl.inf"
+      - content_contains: "[Group Membership]"
+    detection:
+      sigma_condition: |
+        File CONTAINS "[Group Membership]" AND
+        File CONTAINS "*S-1-5-32-544*" AND  # Administrators group
+        File IN SYSVOL_paths AND
+        File.Modified IN last_24h AND
+        File.Modifier NOT IN gpo_admin_accounts
+    tools_used:
+      - "SharpGPOAbuse.exe --AddLocalAdmin --UserAccount {user} --GPOName '{gpo}'"
+    remediation:
+      - Monitor GptTmpl.inf files in SYSVOL for Group Membership section changes
+      - Alert on Event 4732 (Administrators) group additions from Group Policy
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: GPP Passwords (CPassword) — Cached Credentials in SYSVOL  (T1552.006)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: gpo-gpp-passwords-001
+    title: GPP CPassword — Encrypted Credentials in SYSVOL Group Policy Files
+    technique: T1552.006
+    severity: critical
+    description: >
+      Group Policy Preferences (GPP) stored credentials in SYSVOL encrypted with
+      static AES256 key published by Microsoft (MS14-025). Credentials from
+      Groups.xml, Scheduledtasks.xml, Services.xml, DataSources.xml, Drives.xml
+      can be decrypted by any domain user.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [5145]
+          conditions:
+            - field: ShareName
+              value: "\\\\*\\SYSVOL"
+            - field: RelativeTargetName
+              contains_any:
+                - "Groups.xml"
+                - "ScheduledTasks.xml"
+                - "Services.xml"
+                - "DataSources.xml"
+                - "Drives.xml"
+    detection:
+      sigma_condition: |
+        EventID=5145 AND ShareName ENDSWITH "\\SYSVOL" AND
+        RelativeTargetName CONTAINS ANY ["Groups.xml","ScheduledTasks.xml",
+          "Services.xml","DataSources.xml","Drives.xml"] AND
+        count() by SubjectUserName > 10 within 60s  # Bulk enumeration
+      file_content_indicators:
+        - SYSVOL XML files containing "cpassword" attribute
+    tools_used:
+      - "crackmapexec smb {dc} -u {user} -p {pass} -d {dom} -M gpp_password"
+      - "crackmapexec smb {dc} -u {user} -p {pass} -d {dom} -M gpp_autologin"
+      - "Get-GPPPassword"
+      - "findstr /s /i cpassword \\\\{dc}\\sysvol"
+    remediation:
+      - Apply MS14-025 patch (removes ability to create new GPP passwords)
+      - Search and remove existing cpassword fields from SYSVOL
+      - "findstr /s /i cpassword \\\\{dom}\\sysvol\\{dom}\\policies\\ | select-string cpassword"
+      - Reset all credentials found in GPP files
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: GPO Delegation Enumeration  (T1087.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: gpo-delegation-enum-001
+    title: GPO Delegation — Enumerate Write Permissions on Group Policy Objects
+    technique: T1087.002
+    severity: medium
+    description: >
+      Bloodhound and PowerView enumerate GPO write permissions to find accounts
+      with GPO modification rights. Any account with write access to a GPO
+      linked to privileged OUs can compromise all computers in that OU.
+    detection:
+      sigma_condition: |
+        EventID=4662 AND ObjectClass="groupPolicyContainer" AND
+        count() by SubjectUserName > 20 within 60s AND
+        SubjectUserName NOT IN gpo_admin_accounts
+    tools_used:
+      - "Get-DomainGPO | Get-DomainObjectAcl -ResolveGUIDs"
+      - "bloodhound-python -c GPOs"
+    remediation:
+      - Audit GPO write permissions via Group Policy Management Console
+      - Remove non-standard accounts with GPO modification rights
+      - Alert on bulk GPO ACL enumeration
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST CODE ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  file: modules/gpo_abuse.py
+  rules:
+    - id: sast-code-gpo-001
+      title: Base64 Import Present — Check Payload Encoding
+      severity: low
+      pattern: |
+        import base64
+      description: >
+        base64 module imported in GPO abuse module. Verify usage is for
+        legitimate command encoding display only, not for obfuscating
+        actual payload delivery commands.
+
+    - id: sast-code-gpo-002
+      title: Target OU DN Taken from User Input Without Validation
+      severity: medium
+      pattern: |
+        target_ou\s+=\s+prompt\("Target OU DN"\)
+      description: >
+        OU Distinguished Name not validated against actual AD OU list.
+        Linking GPO to wrong OU could affect unintended systems.
+      recommendation: "Enumerate available OUs via LDAP and present list to operator"
+
+    - id: sast-code-gpo-003
+      title: Invoke-GPUpdate Displayed in Command — Immediate Execution Risk
+      severity: medium
+      pattern: |
+        Invoke-GPUpdate.*-Force.*-RandomDelayInMinutes 0
+      description: >
+        Zero-delay forced GPUpdate displayed in command suggestions triggers
+        immediate execution on target. Operators should understand this
+        causes immediate payload execution on all OU members.

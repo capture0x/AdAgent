@@ -1,0 +1,362 @@
+title: AdStrike - Kerberos Attacks Detection Rules
+id: sast-kerberos-001
+status: production
+description: |
+  SAST detection rules for Kerberos-based attack techniques used in
+  Active Directory red team engagements. Covers AS-REP Roasting,
+  Kerberoasting, Pass-the-Ticket, Golden/Silver/Diamond/Sapphire Tickets,
+  Delegation abuse, and RBCD.
+author: AdStrike SAST Module
+date: 2026-04-24
+mitre_attack_version: v14
+tags:
+  - attack.credential_access
+  - attack.lateral_movement
+  - attack.persistence
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: AS-REP Roasting  (T1558.004)
+# ─────────────────────────────────────────────────────────────────────────────
+rules:
+  - id: kerberos-asrep-roast-001
+    title: AS-REP Roasting — Kerberos Pre-Auth Disabled Request
+    technique: T1558.004
+    severity: high
+    description: >
+      Detects AS-REP requests for accounts with Kerberos pre-authentication
+      disabled. Attacker enumerates user list and collects crackable hashes
+      offline via GetNPUsers (impacket) or Rubeus.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4768]
+          conditions:
+            - field: TicketEncryptionType
+              value: "0x17"  # RC4-HMAC — weak encryption → offline cracking
+            - field: PreAuthType
+              value: "0"     # No pre-auth required
+            - field: ResultCode
+              value: "0x0"   # Success
+    detection:
+      indicators:
+        - Multiple 4768 events from same source IP in short window
+        - TicketEncryptionType = 0x17 (RC4) for multiple accounts
+        - Source is NOT a Domain Controller
+      thresholds:
+        - event: 4768
+          count: 10
+          timeframe: 60s
+          groupby: SourceAddress
+    tools_used:
+      - "impacket-GetNPUsers {domain}/ -dc-ip {dc} -usersfile users.txt -format hashcat"
+      - "Rubeus.exe asreproast /nowrap"
+    false_positives:
+      - Legacy applications requiring RC4 Kerberos
+      - Service accounts with pre-auth disabled for compatibility
+    remediation:
+      - Enable Kerberos pre-authentication for ALL accounts
+      - Audit accounts with DONT_REQ_PREAUTH flag via PowerShell
+      - "Get-ADUser -Filter {DoesNotRequirePreAuth -eq $true}"
+      - Enforce AES256 encryption for all Kerberos tickets
+    references:
+      - https://attack.mitre.org/techniques/T1558/004/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Kerberoasting  (T1558.003)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: kerberos-kerberoast-001
+    title: Kerberoasting — TGS Request for Service Accounts with SPN
+    technique: T1558.003
+    severity: high
+    description: >
+      Detects bulk TGS requests for service accounts with SPNs. Attacker
+      uses authenticated account to request service tickets and cracks them
+      offline. High number of TGS requests from single host is anomalous.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4769]
+          conditions:
+            - field: TicketEncryptionType
+              value: "0x17"  # RC4 → crackable offline
+            - field: TicketOptions
+              value: "0x40810000"
+            - field: ServiceName
+              not_contains: ["krbtgt", "$"]  # Exclude computer accounts/TGT
+    detection:
+      indicators:
+        - Multiple 4769 events with RC4 encryption from same source
+        - Service account enumeration pattern (many SPNs requested)
+        - Requests outside business hours
+      thresholds:
+        - event: 4769
+          encryption: "0x17"
+          count: 5
+          timeframe: 30s
+          groupby: SourceAddress
+      sigma_condition: "(EventID=4769 AND TicketEncryptionType=0x17) | count() by SourceAddress > 5 within 30s"
+    tools_used:
+      - "impacket-GetUserSPNs {domain}/{user}:{pass} -request -outputfile hashes.txt"
+      - "Rubeus.exe kerberoast /nowrap"
+      - "Invoke-Kerberoast -OutputFormat HashCat"
+    false_positives:
+      - Legitimate service account authentication bursts
+      - Backup/monitoring solutions with many service connections
+    remediation:
+      - Use gMSA (Group Managed Service Accounts) — auto-rotating 240-char passwords
+      - Set service account passwords to 30+ random characters
+      - Monitor for RC4 TGS requests (prefer AES256)
+      - Enable "Audit Kerberos Service Ticket Operations" GPO
+    references:
+      - https://attack.mitre.org/techniques/T1558/003/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Pass-the-Ticket  (T1550.003)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: kerberos-ptt-001
+    title: Pass-the-Ticket — Kerberos Ticket Injection via klist/Rubeus
+    technique: T1550.003
+    severity: critical
+    description: >
+      Detects Kerberos ticket injection into a logon session from outside
+      the normal Kerberos authentication flow. Golden/Silver tickets and
+      stolen .ccache files are injected to gain unauthorized access.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4768, 4769, 4770, 4624]
+    process_indicators:
+      - process_name: "Rubeus.exe"
+        command_contains: ["ptt", "asktgt", "asktgs", "s4u"]
+      - process_name: "mimikatz.exe"
+        command_contains: ["kerberos::ptt", "kerberos::golden", "kerberos::silver"]
+    file_indicators:
+      - extension: ".ccache"
+        environment_variable: "KRB5CCNAME"
+      - extension: ".kirbi"
+    network_indicators:
+      - destination_port: 88
+        protocol: kerberos
+        from_unexpected_source: true
+    detection:
+      indicators:
+        - KRB5CCNAME environment variable set to non-standard path
+        - Ticket with unusually long lifetime (Golden: 10 years)
+        - Ticket encryption using RC4 when AES256 is domain standard
+        - Logon type 9 (NewCredentials) followed by Kerberos activity
+        - Event 4769 with missing correlated 4768
+      sigma_condition: |
+        (EventID=4624 AND LogonType=9 AND AuthenticationPackage=Kerberos)
+        OR (EventID=4769 AND NOT correlated_with EventID=4768)
+    tools_used:
+      - "export KRB5CCNAME=/tmp/admin.ccache; impacket-psexec domain/admin@dc -k -no-pass"
+      - "Rubeus.exe ptt /ticket:<base64>"
+      - "mimikatz kerberos::ptt ticket.kirbi"
+    remediation:
+      - Enable Protected Users security group for privileged accounts
+      - Implement Credential Guard (blocks ticket extraction from LSASS)
+      - Monitor for anomalous Kerberos ticket lifetimes
+      - Enforce AES256 — disable RC4 (KB4598347)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Golden Ticket  (T1558.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: kerberos-golden-ticket-001
+    title: Golden Ticket — Forged TGT Using krbtgt Hash
+    technique: T1558.001
+    severity: critical
+    description: >
+      Detects creation and use of Golden Tickets — forged TGTs signed with the
+      krbtgt account NTLM hash. Golden tickets can impersonate any user,
+      survive password resets, and grant arbitrary group memberships.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4769, 4672, 4624]
+    detection:
+      indicators:
+        - TGT with lifetime > 10 hours (Golden tickets default to 10 years)
+        - Ticket for non-existent user account (no 4768 event)
+        - Logon with domain admin privileges from unexpected workstation
+        - TGT encryption type RC4 (0x17) when domain enforces AES
+        - UserAccountControl: 0x10 (no account required for forged ticket)
+        - Missing PAC validation events on DC
+        - Ticket issued by non-DC source IP
+      anomaly_rules:
+        - "TGT lifetime > 600 minutes AND account not in Protected Users"
+        - "Kerberos service ticket for CIFS/DC from account with SID mismatch"
+        - "4672 (Special Logon) from account with DA SIDs but no prior 4624"
+    tools_used:
+      - "impacket-ticketer -nthash {krbtgt} -domain-sid {sid} -domain {dom} Administrator"
+      - "Rubeus.exe golden /rc4:{krbtgt} /domain:{dom} /sid:{sid} /user:Administrator /ptt"
+      - "mimikatz kerberos::golden /krbtgt:{hash} /domain:{dom} /sid:{sid} /user:Admin /ptt"
+    remediation:
+      - Reset krbtgt password TWICE (invalidates all existing tickets)
+      - Enable PAC validation (KB5008380)
+      - Monitor for 4769 events without corresponding 4768
+      - Implement Microsoft ATA / Defender for Identity — golden ticket detection
+      - Add privileged accounts to Protected Users group
+    references:
+      - https://attack.mitre.org/techniques/T1558/001/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Silver Ticket  (T1558.002)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: kerberos-silver-ticket-001
+    title: Silver Ticket — Forged Service Ticket Using Service Account Hash
+    technique: T1558.002
+    severity: critical
+    description: >
+      Detects Silver Ticket attacks — forged TGS tickets signed with service
+      account NTLM hash. Bypasses the KDC entirely. More stealthy than Golden
+      Ticket as no DC authentication required.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4624, 4625, 4634, 4769]
+      - system_eventlog:
+          event_ids: [7045]  # Service installation
+    detection:
+      indicators:
+        - Service ticket presented WITHOUT prior TGT (no 4768 event on DC)
+        - PAC validation failure (Event 4769 with ResultCode 0x1F)
+        - Authentication to specific service (CIFS, HTTP, HOST, LDAP) without KDC interaction
+        - Logon event with no preceding Kerberos AS exchange
+        - Missing Ticket-Granting Ticket audit trail
+      sigma_condition: |
+        (EventID=4624 AND AuthPackage=Kerberos AND NOT preceded_by EventID=4768
+         within 5m on DC) AND (ServiceName IN ["CIFS","HOST","HTTP","LDAP","RPCSS"])
+    tools_used:
+      - "impacket-ticketer -nthash {svc_hash} -domain-sid {sid} -domain {dom} -spn cifs/server silverticket"
+      - "mimikatz kerberos::golden /user:Admin /service:cifs /rc4:{hash} /target:srv /ptt"
+      - "Rubeus.exe silver /service:cifs/{target} /rc4:{hash} /sid:{sid} /user:Admin /ptt"
+    remediation:
+      - Rotate service account passwords regularly (use gMSA)
+      - Enable PAC validation — KB5008380
+      - Monitor for service authentications without DC-side Kerberos events
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Diamond Ticket  (T1558.001 variant)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: kerberos-diamond-ticket-001
+    title: Diamond Ticket — Stealthy TGT Modification (Evades Golden Ticket Detection)
+    technique: T1558.001
+    severity: critical
+    description: >
+      Diamond Ticket modifies a legitimate TGT in-memory rather than forging
+      from scratch. Harder to detect than Golden Ticket as real TGT was
+      requested from KDC. Rubeus diamond command uses /tgtdeleg or krbtgt AES key.
+    detection:
+      indicators:
+        - Rubeus.exe with "diamond" argument in command line
+        - TGT with modified PAC group membership (SID mismatch with LDAP)
+        - /tgtdeleg flag — Kerberos unconstrained delegation abuse
+        - AES256 ticket with anomalous RID/group membership
+        - S4U2Self request followed by ticket modification
+      process_indicators:
+        - command_contains: ["diamond", "tgtdeleg", "ticketuser", "ticketuserid"]
+      sigma_condition: |
+        (process=Rubeus.exe AND CommandLine CONTAINS "diamond") OR
+        (EventID=4769 AND GroupMembership_in_PAC differs from LDAP_group_membership)
+    tools_used:
+      - "Rubeus.exe diamond /tgtdeleg /enctype:aes /ticketuser:Administrator /domain:{dom} /dc:{dc} /ptt"
+      - "Rubeus.exe diamond /krbkey:{aes256} /user:{user} /password:{pw} /enctype:aes /ticketuser:Admin /ptt"
+    remediation:
+      - Monitor Rubeus.exe execution (process creation events)
+      - Implement PAC validation KB5008380 (checks SID consistency)
+      - Alert on /tgtdeleg usage — Kerberos delegation from unexpected accounts
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Unconstrained Delegation Abuse  (T1134.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: kerberos-unconstrained-delegation-001
+    title: Unconstrained Delegation — TGT Capture via Coercion
+    technique: T1134.001
+    severity: critical
+    description: >
+      Computers with Unconstrained Delegation store TGTs for all authenticating
+      users in LSASS. Attacker coerces DC authentication to this host, captures
+      DC's TGT, and uses it to compromise the domain.
+    event_sources:
+      - windows_security_eventlog:
+          event_ids: [4768, 4769]
+    detection:
+      indicators:
+        - TGT forwarded to non-DC computer (flag: forwardable TGT on workstation)
+        - Coercion traffic to host with Unconstrained Delegation flag
+        - Computer account with TrustedForDelegation = True (non-DC)
+        - Rubeus monitor/triage output on delegation host
+        - PrintSpooler, EfsRpc, MS-DFSNM connections from DC to workstation
+    sigma_condition: |
+      (EventID=4768 AND TicketOptions CONTAINS "forwardable"
+       AND ClientAddress NOT IN DC_IP_list)
+      OR (EventID=4769 AND ServiceName contains "$" AND
+          destination NOT in DC_list)
+    tools_used:
+      - "Rubeus.exe monitor /interval:5 /filteruser:DC$"
+      - "impacket-findDelegation {dom}/{user}:{pass} -dc-ip {dc}"
+    remediation:
+      - Remove Unconstrained Delegation from non-DC computers
+      - Enable "Account is sensitive and cannot be delegated" on privileged accounts
+      - Use Constrained Delegation or Resource-Based Constrained Delegation instead
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE: Constrained Delegation S4U2Proxy  (T1134.001)
+# ─────────────────────────────────────────────────────────────────────────────
+  - id: kerberos-constrained-delegation-001
+    title: Constrained Delegation S4U2Proxy Abuse
+    technique: T1134.001
+    severity: high
+    description: >
+      Abuses S4U2Self/S4U2Proxy extensions to impersonate any user to services
+      the compromised account is allowed to delegate to. Requires control of an
+      account with msDS-AllowedToDelegateTo attribute set.
+    detection:
+      indicators:
+        - S4U2Self request (Protocol Transition): EventID 4769 with specific ticket options
+        - S4U2Proxy request: forwarded ticket for impersonated user
+        - impacket getST or Rubeus s4u in command line
+        - Impersonation of Administrator/DA to sensitive services
+      process_indicators:
+        - command_contains: ["getST", "s4u", "impersonateuser", "msdsspn"]
+    tools_used:
+      - "impacket-getST -spn cifs/{target}.{dom} -impersonate Administrator {dom}/{user}:{pass}"
+      - "Rubeus.exe s4u /user:{svc} /aes256:{key} /impersonateuser:Admin /msdsspn:cifs/{target} /ptt"
+    remediation:
+      - Audit msDS-AllowedToDelegateTo attributes
+      - Enable "Account is sensitive and cannot be delegated" for privileged users
+      - Prefer RBCD over Constrained Delegation where possible
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SAST SCAN RULES FOR TOOL CODE
+# ─────────────────────────────────────────────────────────────────────────────
+sast_code_analysis:
+  description: Static analysis rules for the AdStrike tool code itself
+  rules:
+    - id: sast-code-kerberos-001
+      title: Hardcoded Kerberos Ticket Path
+      severity: medium
+      pattern: |
+        KRB5CCNAME=\/tmp\/
+      file_patterns: ["*.py", "*.sh"]
+      description: >
+        Kerberos ticket cache written to /tmp — world-readable. Use user-private
+        directory instead ($HOME or /run/user/$UID).
+      recommendation: "Use mktemp or $HOME/.ccache instead of /tmp/"
+
+    - id: sast-code-kerberos-002
+      title: Password Passed via Shell Command String (Injection Risk)
+      severity: high
+      pattern: |
+        run_cmd\(f".*'{pw}'.*"\)
+      file_patterns: ["*.py"]
+      description: >
+        Password is interpolated directly into shell command string. If password
+        contains shell metacharacters ($, `, ;, &), command injection is possible.
+      recommendation: "Use subprocess with argument list (not shell=True) or sanitize with shlex.quote()"
+
+    - id: sast-code-kerberos-003
+      title: NTLM Hash in Command String
+      severity: high
+      pattern: |
+        run_cmd\(f".*hashes.*:{nth}.*"\)
+      file_patterns: ["*.py"]
+      description: >
+        NTLM hash interpolated into shell command — appears in process list
+        and shell history. Consider using stdin or temporary file.
+      recommendation: "Pass sensitive values via environment variables or stdin, not command line arguments"

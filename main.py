@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  AdAgent — AI-Powered Active Directory Attack Agent                  ║
+║  AdAgent — AI-Powered Active Directory Attack Agent               ║
 ║  AUTHORISED PENETRATION TESTING & RED TEAM ENGAGEMENTS ONLY          ║
 ║                                               By TMRSWRR             ║
 ╚══════════════════════════════════════════════════════════════════════╝
@@ -23,7 +23,7 @@ from config.settings import SESSION, CONFIG, save_session, load_session, get_aut
 VERSION  = "1.0"
 CODENAME = "AdAgent"
 AUTHOR   = "tmrswrr"
-BUILD    = "2026.05"
+BUILD    = "2026.06"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BANNER
@@ -37,18 +37,19 @@ _ART = r"""
                        /____/
 """
 
-# ── Professional palette — easy on the eyes, high readability ─────────────────
-CYAN    = "\033[38;2;0;180;216m"    # #00B4D8 — primary labels / info
-VIOLET  = "\033[38;2;123;47;190m"   # #7B2FBE — secondary accent
-GREEN   = "\033[38;2;6;214;160m"    # #06D6A0 — success / ready
-YELLOW  = "\033[38;2;255;183;3m"    # #FFB703 — warning
-RED     = "\033[38;2;239;35;60m"    # #EF233C — error / critical
-WHITE   = "\033[38;2;237;242;244m"  # #EDF2F4 — primary text / values
-GRAY    = "\033[38;2;141;153;174m"  # #8D99AE — secondary / dim text
+# ── AdAgent synthwave palette — neon, modern, high readability ─────────────
+CYAN    = "\033[38;2;45;226;230m"   # #2DE2E6 — primary labels / info
+VIOLET  = "\033[38;2;185;103;255m"  # #B967FF — secondary accent / borders
+PINK    = "\033[38;2;255;106;193m"  # #FF6AC1 — glow accent / high
+GREEN   = "\033[38;2;54;241;205m"   # #36F1CD — mint · success / ready
+YELLOW  = "\033[38;2;255;196;0m"    # #FFC400 — amber · warning
+RED     = "\033[38;2;255;56;100m"   # #FF3864 — hot red · error / critical
+WHITE   = "\033[38;2;234;230;255m"  # #EAE6FF — lavender · text / values
+GRAY    = "\033[38;2;139;131;168m"  # #8B83A8 — secondary / dim text
 
 # Legacy aliases kept so nothing breaks
 PURPLE  = VIOLET
-MAGENTA = CYAN
+MAGENTA = PINK
 
 _C1   = CYAN
 _C2   = VIOLET
@@ -60,7 +61,8 @@ _BANNER_ANIMATED  = False
 
 
 def _render_banner(offset: int = 0, indent: int = 0) -> str:
-    palette = [CYAN, VIOLET]
+    # Synthwave sweep: cyan → violet → pink down the glyph rows.
+    palette = [CYAN, VIOLET, PINK]
     prefix  = " " * max(indent, 0)
     out     = []
     for i, line in enumerate(ln for ln in _ART.splitlines() if ln.strip()):
